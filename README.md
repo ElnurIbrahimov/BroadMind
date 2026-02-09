@@ -70,6 +70,14 @@ python BroadMind_v074_complete.py
 
 Trains from scratch and saves the checkpoint to `broadmind_v074_complete.pt`.
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the full development plan:
+
+- **v0.75** -- Task Scaling: train on 4-step programs, generalize to 16-32 steps
+- **v0.76** -- Hardware-Adaptive Compute: one model, many deployment profiles
+- **v0.77** -- Edge Deployment: run on Raspberry Pi, phones, microcontrollers
+
 ## Requirements
 
 - Python 3.8+
