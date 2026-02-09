@@ -65,7 +65,7 @@ Per-Length:
 ## Usage
 
 ```bash
-python FluxMind_v074_complete.py
+python BroadMind_v074_complete.py
 ```
 
 Trains from scratch and saves the checkpoint to `broadmind_v074_complete.pt`.

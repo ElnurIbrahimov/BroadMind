@@ -1,11 +1,11 @@
-# FluxMind: Achievement Documentation
+# BroadMind: Achievement Documentation
 ## Self-Improving Neural Architecture with Latent Program Induction
 
 ---
 
 ## Executive Summary
 
-FluxMind is a novel neural architecture that **writes its own internal programs at runtime**. Unlike transformers that apply fixed learned weights, FluxMind generates latent instructions during execution and runs them to produce outputs.
+BroadMind is a novel neural architecture that **writes its own internal programs at runtime**. Unlike transformers that apply fixed learned weights, BroadMind generates latent instructions during execution and runs them to produce outputs.
 
 **Key Results Achieved:**
 
@@ -21,7 +21,7 @@ FluxMind is a novel neural architecture that **writes its own internal programs 
 
 > **Ultra-Adaptive Learning**: It doesn't just learn from text or images—it evolves its own learning strategies based on hardware availability.
 
-> **Low-Energy, High-IQ Mode**: Think of it as the Zen monk of AI. While GPTs are chugging electricity like they're brewing coffee for the planet, FluxMind quietly sips power, then drops an insight.
+> **Low-Energy, High-IQ Mode**: Think of it as the Zen monk of AI. While GPTs are chugging electricity like they're brewing coffee for the planet, BroadMind quietly sips power, then drops an insight.
 
 > **Memory on the Fly**: It doesn't store everything forever. It keeps just the "juice"—the nuggets of wisdom—and forgets the fluff.
 
@@ -120,7 +120,7 @@ The model decides how much computation to use based on problem difficulty. Easy 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      FluxMind Architecture                       │
+│                      BroadMind Architecture                       │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     │
@@ -155,7 +155,7 @@ The model decides how much computation to use based on problem difficulty. Easy 
 
 ---
 
-## What FluxMind is NOT
+## What BroadMind is NOT
 
 | ❌ NOT This | ✅ IS This |
 |-------------|-----------|
@@ -182,7 +182,7 @@ The model decides how much computation to use based on problem difficulty. Easy 
 1. **Pre-computed latent plans** — Can't handle conditionals
 2. **Halting from state alone** — Can't distinguish program lengths
 3. **Mixed task+halt loss** — Objectives fight each other
-4. **CYCLE/permutation operations** — Need non-local info (violates FluxMind philosophy)
+4. **CYCLE/permutation operations** — Need non-local info (violates BroadMind philosophy)
 
 ### Scaling Law (Empirical)
 
@@ -214,16 +214,16 @@ Rule of thumb: ~2.5-3× parameters per 50% task complexity increase.
 ### Core Implementations
 | File | Description |
 |------|-------------|
-| `FluxMind_v070j2_conditionals.py` | Latent program induction with conditionals |
-| `FluxMind_v072b_wisdom.py` | Wisdom distillation |
-| `FluxMind_v073d_adaptive.py` | Adaptive compute (Zen monk) |
+| `BroadMind_v070j2_conditionals.py` | Latent program induction with conditionals |
+| `BroadMind_v072b_wisdom.py` | Wisdom distillation |
+| `BroadMind_v073d_adaptive.py` | Adaptive compute (Zen monk) |
 
 ### Saved Models
 | File | Accuracy |
 |------|----------|
-| `fluxmind_v070j2_best.pt` | 96.5% |
-| `fluxmind_v072b_wisdom.pt` | 99.6% |
-| `fluxmind_v073d_adaptive.pt` | 100% |
+| `broadmind_v070j2_best.pt` | 96.5% |
+| `broadmind_v072b_wisdom.pt` | 99.6% |
+| `broadmind_v073d_adaptive.pt` | 100% |
 
 ---
 
@@ -238,7 +238,7 @@ Rule of thumb: ~2.5-3× parameters per 50% task complexity increase.
 ## Citation
 
 ```
-FluxMind: Self-Improving Neural Architecture
+BroadMind: Self-Improving Neural Architecture
 with Latent Program Induction
 
 Key Results:
