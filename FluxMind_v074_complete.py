@@ -1003,10 +1003,10 @@ def main():
         print(f"  Length {length}: {r['accuracy']:.1f}% acc, {r['avg_steps']:.1f} steps {match}")
     
     # ========================================================================
-    # THE COMPLETE FLUXMIND TEST
+    # THE COMPLETE BROADMIND TEST
     # ========================================================================
     print("\n" + "=" * 70)
-    print("THE COMPLETE FLUXMIND TEST")
+    print("THE COMPLETE BROADMIND TEST")
     print("=" * 70)
     
     l1 = results['by_length'][1]
@@ -1034,7 +1034,7 @@ def main():
     Accuracy: {results['accuracy']:.1f}% {'[PASS]' if accurate else '[FAIL]'}
     Mixed-Program: {mixed_results['accuracy']:.1f}% {'[PASS]' if mixed_accurate else '[FAIL]'}
 
-FLUXMIND STATUS: {'COMPLETE' if all_pass else 'PARTIAL'}
+BROADMIND STATUS: {'COMPLETE' if all_pass else 'PARTIAL'}
 """)
     
     # ========================================================================
