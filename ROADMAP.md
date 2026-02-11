@@ -1,21 +1,24 @@
 # BroadMind Roadmap
 
-## Where We Are (v0.74)
+## Where We Are (v0.76)
 
-BroadMind v0.74 is a neural program executor that learns latent reasoning circuits at runtime. It is not a transformer -- it generates and executes internal programs on the fly.
+BroadMind v0.76 is a neural program executor that learns latent reasoning circuits at runtime. It is not a transformer -- it generates and executes internal programs on the fly.
 
 **Current capabilities:**
 - 4 task families, 13 operations (ACCUMULATE, TRANSFER, COMPARE, DECREMENT)
 - Mixed-program execution across all families
 - Wisdom distillation (compresses experience into 48-float codes)
 - Adaptive compute (uses exactly as many steps as needed)
-- 477K parameters, runs on CPU or CUDA
+- Length generalization via sinusoidal encodings + noise injection (v0.75)
+- Mixture of Recursions: adaptive inner depth per solver step (v0.76)
+- ~445K parameters, runs on CPU or CUDA
 
 **Current results:**
-- 99.6% single-family accuracy
-- 99.7% mixed-program accuracy
+- 99%+ single-family and mixed-program accuracy
 - 100% wisdom matching
 - Perfect adaptive step matching
+- Length generalization: 90%+ at 8 steps, 80%+ at 16 steps (trained on 1-4)
+- MoR depth hierarchy: COMPARE > TRANSFER > ACC/DEC
 
 ---
 
@@ -23,7 +26,7 @@ BroadMind v0.74 is a neural program executor that learns latent reasoning circui
 
 Three development tracks, prioritized by research impact and feasibility.
 
-### Track 1: Task Scaling (v0.75) -- NEXT
+### Track 1: Task Scaling (v0.75) -- DONE
 
 > *"Invents reasoning circuits on the go"* -- scaled up.
 
@@ -57,7 +60,21 @@ Three development tracks, prioritized by research impact and feasibility.
 
 ---
 
-### Track 2: Hardware-Adaptive Compute (v0.76)
+### Track 2: Mixture of Recursions (v0.76) -- DONE
+
+> *"Adaptive depth per operation"* -- the model decides how deeply to process each step.
+
+**What was built:** An adaptive inner recursion system where shared solver weights iterate 1-4 times per step. A learned router (Gumbel-Softmax) selects depth based on operation complexity. Simple ops exit early; complex ops get iterative refinement.
+
+**Results achieved:**
+- Depth hierarchy emerges: COMPARE > TRANSFER > ACC/DEC
+- Efficient routing: overall mean depth < 3.0
+- Compute cost regularization prevents always-max-depth
+- ~445K params (+24K over v0.75)
+
+---
+
+### Track 3: Hardware-Adaptive Compute (v0.77) -- NEXT
 
 > *"Evolves its own learning strategies based on hardware availability."*
 
@@ -189,9 +206,10 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | "Keeps the juice, forgets the fluff" | Done | v0.72b |
 | "Sips power, drops insight" | Done | v0.73d |
 | Mixed-program execution | Done | v0.74 |
-| Length generalization (long programs) | Planned | v0.75 |
-| Hardware-adaptive compute | Planned | v0.76 |
-| Physical integration (edge devices) | Planned | v0.77 |
+| Length generalization (long programs) | Done | v0.75 |
+| Mixture of Recursions (adaptive inner depth) | Done | v0.76 |
+| Hardware-adaptive compute | Planned | v0.77 |
+| Physical integration (edge devices) | Planned | v0.78 |
 | "Evolves learning strategies" | Future | TBD |
 
 ---
@@ -204,6 +222,7 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | v0.72b | Wisdom distillation | 422K | 99.6% |
 | v0.73d | Adaptive compute | ~450K | 100% |
 | v0.74 | Complete model (all above + DECREMENT + mixed programs) | 477K | 99.7% |
-| v0.75 | Task scaling (length generalization) | ~477K | TBD |
-| v0.76 | Hardware-adaptive compute | ~477K | TBD |
-| v0.77 | Edge deployment | ~477K (INT8: 477KB) | TBD |
+| v0.75 | Task scaling (length generalization) | ~421K | 99%+ ID, 80%+ at 16 steps |
+| v0.76 | Mixture of Recursions (adaptive inner depth) | ~445K | 99%+ with depth hierarchy |
+| v0.77 | Hardware-adaptive compute | ~445K | TBD |
+| v0.78 | Edge deployment | ~445K (INT8: ~445KB) | TBD |
