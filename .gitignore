@@ -1,1 +1,22 @@
 __pycache__/
+
+# Model checkpoints (large binary files)
+*.pt
+
+# Python
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

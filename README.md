@@ -1,14 +1,15 @@
 # BroadMind
 
-A neural program executor that learns to run programs through latent reasoning, wisdom distillation, adaptive compute, and mixture of recursions. **Not a transformer** -- it generates and executes its own internal programs at runtime.
+A neural program executor that learns to run programs through latent reasoning, wisdom distillation, adaptive compute, mixture of recursions, and elastic inference. **Not a transformer** -- it generates and executes its own internal programs at runtime.
 
-## Latest: v0.76 (Mixture of Recursions)
+## Latest: v0.77 (Hardware-Adaptive Compute)
 
 | Version | What It Adds | Params | Accuracy |
 |---|---|---|---|
 | v0.74 | Wisdom distillation + Adaptive compute | 477K | 99.7% |
 | v0.75 | Length generalization (sinusoidal encoding, noise injection) | ~421K | 99%+ ID, tested to 16 steps |
 | v0.76 | Mixture of Recursions (adaptive inner depth per step) | ~445K | 99%+ with depth hierarchy |
+| v0.77 | Elastic inference (25-100% width, 1-4 depth, auto-config) | ~447K | 100% full, 98.5% at 50% width |
 
 ## What It Does
 
@@ -27,7 +28,7 @@ Programs can mix operations from any family.
 
 ## Architecture
 
-Five core capabilities:
+Six core capabilities:
 
 1. **Latent Program Induction** -- the model generates its own internal instructions (96-dim latent vectors) at runtime, conditioned on the current state. This is runtime program synthesis, not pattern matching.
 
@@ -37,7 +38,9 @@ Five core capabilities:
 
 4. **Length Generalization** (v0.75) -- sinusoidal step encodings replace learned embeddings, enabling generalization to program lengths never seen during training. Gaussian noise injection during training improves robustness.
 
-5. **Mixture of Recursions** (v0.76) -- within each solver step, shared weights can iterate 1-4 times. A learned router selects depth based on operation complexity. Simple ops (ACC, DEC) exit early; complex ops (COMPARE) get deeper processing.
+5. **Mixture of Recursions** (v0.76) -- within each solver step, shared weights can iterate 1-4 times. A learned router selects depth based on operation complexity.
+
+6. **Elastic Inference** (v0.77) -- one training run produces a model that runs at 25/50/75/100% width and 1-4 recursion depth. A device profiler auto-selects the largest config within a latency target. Matryoshka-style weight slicing, SwitchableLayerNorm, cascaded self-distillation, and depth distillation enable deployment from microcontrollers to full GPU.
 
 ```
 Input: initial_state (x, y, z) + program [op1, op2, ..., opN]
@@ -53,11 +56,15 @@ Input: initial_state (x, y, z) + program [op1, op2, ..., opN]
         [Halter] -> should we stop?
                 |
     Output: predicted final state
+
+    At inference: DeviceProfiler selects width/depth config  (v0.77)
+    Width slicing: W[:d_eff_out, :d_eff_in] for all layers
+    SwitchableLayerNorm: separate stats per width config
 ```
 
 ## Training
 
-6-phase curriculum (v0.76):
+8-phase curriculum (v0.77):
 
 | Phase | What | Iterations |
 |---|---|---|
@@ -67,37 +74,49 @@ Input: initial_state (x, y, z) + program [op1, op2, ..., opN]
 | 3 | Halter only (solver frozen) | 1500 |
 | 4 | End-to-end fine-tune (mixed_prob=0.3) | 1500 |
 | 5 | Length generalization (noise injection) | 500 |
+| 6 | Elastic training (width + depth, 22% depth masking) | 2500 |
+| 7 | Cascaded distillation + depth distillation | 1000 |
+| 8 | Recovery with width emphasis | 300 |
 
-## Results (v0.76)
+Phases 1-5 train the full-width model to convergence. Phases 6-8 teach the model to function at reduced width/depth while preserving full-width quality.
+
+## Results (v0.77)
 
 ```
-Overall Accuracy:       99%+
-Mixed-Program Accuracy: 99%+
+Overall Accuracy:       100%
+Mixed-Program Accuracy: 100%
 Wisdom Matching:        100%
 Adaptive Steps Match:   exact
 
 Per-Family:
   ACCUMULATE: 100%
   TRANSFER:   100%
-  COMPARE:    98%+
+  COMPARE:    100%
   DECREMENT:  100%
 
 Length Generalization (trained on 1-4):
-  Length  4: 99%+
-  Length  8: 90%+
-  Length 12: 85%+
-  Length 16: 80%+
+  Length  4: 100%
+  Length  8: 98.7%
+  Length 12: 94.3%
+  Length 16: 89.0%
 
-MoR Depth Hierarchy:
-  COMPARE ops get deeper recursion than TRANSFER > ACC/DEC
+Elastic Inference:
+  Full (w=1.0, d=4):       100.0%  (target >99%)
+  75% width (w=0.75, d=4): 100.0%  (target >97%)
+  50% width (w=0.5, d=4):  98.5%   (target >95%)
+  Half depth (w=1.0, d=2): 100.0%  (target >90%)
+  Device Profile: auto-selected based on latency target
 ```
 
-~445K parameters. Runs on CPU or CUDA.
+~447K parameters. Runs on CPU or CUDA.
 
 ## Usage
 
 ```bash
-# Latest (v0.76 - Mixture of Recursions)
+# Latest (v0.77 - Elastic Inference)
+python BroadMind_v077_elastic.py
+
+# v0.76 (Mixture of Recursions)
 python BroadMind_v076_mor.py
 
 # v0.75 (Length Generalization)
@@ -115,7 +134,7 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan:
 
 - **v0.75** -- Task Scaling (length generalization) -- DONE
 - **v0.76** -- Mixture of Recursions (adaptive inner depth) -- DONE
-- **v0.77** -- Hardware-Adaptive Compute: one model, many deployment profiles
+- **v0.77** -- Hardware-Adaptive Compute (elastic inference) -- DONE
 - **v0.78** -- Edge Deployment: run on Raspberry Pi, phones, microcontrollers
 
 ## Requirements

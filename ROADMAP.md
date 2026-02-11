@@ -74,11 +74,20 @@ Three development tracks, prioritized by research impact and feasibility.
 
 ---
 
-### Track 3: Hardware-Adaptive Compute (v0.77) -- NEXT
+### Track 3: Hardware-Adaptive Compute (v0.77) -- DONE
 
 > *"Evolves its own learning strategies based on hardware availability."*
 
 **Goal:** One model, many deployment profiles. The model detects available resources and adjusts its own depth and width at inference time.
+
+**Results achieved:**
+- Full model (w=1.0, d=4): 100.0% accuracy (target >99%)
+- 50%-width model (w=0.5, d=4): 98.5% accuracy (target >95%)
+- Half-depth model (w=1.0, d=2): 100.0% accuracy (target >90%)
+- 75%-width model (w=0.75, d=4): 100.0% accuracy
+- Device profiler auto-selects config within latency target
+- ~447K params (+2.3K over v0.76 from SwitchableLayerNorm)
+- Length generalization preserved: L4 100%, L8 98.7%, L12 94.3%, L16 89.0%
 
 #### Planned techniques
 
@@ -128,7 +137,7 @@ Adaptive range: 120K - 470K per input
 
 ---
 
-### Track 3: Edge Deployment (v0.77)
+### Track 4: Edge Deployment (v0.78)
 
 > *"AI that doesn't need a data center to be brilliant."*
 
@@ -208,7 +217,7 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | Mixed-program execution | Done | v0.74 |
 | Length generalization (long programs) | Done | v0.75 |
 | Mixture of Recursions (adaptive inner depth) | Done | v0.76 |
-| Hardware-adaptive compute | Planned | v0.77 |
+| Hardware-adaptive compute (elastic inference) | Done | v0.77 |
 | Physical integration (edge devices) | Planned | v0.78 |
 | "Evolves learning strategies" | Future | TBD |
 
@@ -224,5 +233,5 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | v0.74 | Complete model (all above + DECREMENT + mixed programs) | 477K | 99.7% |
 | v0.75 | Task scaling (length generalization) | ~421K | 99%+ ID, 80%+ at 16 steps |
 | v0.76 | Mixture of Recursions (adaptive inner depth) | ~445K | 99%+ with depth hierarchy |
-| v0.77 | Hardware-adaptive compute | ~445K | TBD |
-| v0.78 | Edge deployment | ~445K (INT8: ~445KB) | TBD |
+| v0.77 | Elastic inference (width/depth auto-config) | ~447K | 100% full, 98.5% at 50% width |
+| v0.78 | Edge deployment | ~447K (INT8: ~447KB) | TBD |

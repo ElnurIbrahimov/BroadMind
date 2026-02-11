@@ -14,6 +14,10 @@ BroadMind is a novel neural architecture that **writes its own internal programs
 | Latent Program Induction | v0.70j2 | 96.5% | Model invents reasoning circuits |
 | Wisdom Distillation | v0.72b | 99.6% | Keeps essence, forgets examples |
 | Adaptive Compute | v0.73d | 100% | Sips power, uses minimal steps |
+| Mixed-Program Execution | v0.74 | 99.7% | Handles any op combination |
+| Length Generalization | v0.75 | 89%+ at L16 | Scales beyond training lengths |
+| Mixture of Recursions | v0.76 | 99%+ | Adaptive inner depth per op |
+| Elastic Inference | v0.77 | 100% full, 98.5% at 50% | One model, many hardware profiles |
 
 ---
 
@@ -201,11 +205,14 @@ Rule of thumb: ~2.5-3× parameters per 50% task complexity increase.
 
 | Vision Element | Status | Version |
 |----------------|--------|---------|
-| "Invents reasoning circuits on the go" | ✅ DONE | v0.70j2 |
-| "Keeps the juice, forgets the fluff" | ✅ DONE | v0.72b |
-| "Sips power, drops insight" | ✅ DONE | v0.73d |
-| "Evolves learning strategies" | ❌ TODO | — |
-| "Physical integration" (edge) | ❌ TODO | — |
+| "Invents reasoning circuits on the go" | DONE | v0.70j2 |
+| "Keeps the juice, forgets the fluff" | DONE | v0.72b |
+| "Sips power, drops insight" | DONE | v0.73d |
+| Mixed-program execution | DONE | v0.74 |
+| Length generalization (long programs) | DONE | v0.75 |
+| Mixture of Recursions (adaptive inner depth) | DONE | v0.76 |
+| "Evolves learning strategies based on hardware" | DONE | v0.77 |
+| "Physical integration" (edge) | TODO | v0.78 |
 
 ---
 
@@ -229,9 +236,7 @@ Rule of thumb: ~2.5-3× parameters per 50% task complexity increase.
 
 ## Next Steps
 
-1. **Combine v0.72b + v0.73d** — Wisdom distillation + adaptive compute in one model
-2. **v0.74: Evolving Learning Strategies** — Model adapts HOW it learns
-3. **Edge Deployment** — Test on minimal hardware
+1. **v0.78: Edge Deployment** -- Quantize to INT8, export to ONNX, run on Raspberry Pi and microcontrollers
 
 ---
 
