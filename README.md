@@ -2,7 +2,7 @@
 
 A neural program executor that learns to run programs through latent reasoning, wisdom distillation, adaptive compute, mixture of recursions, and elastic inference. **Not a transformer** -- it generates and executes its own internal programs at runtime.
 
-## Latest: v0.77 (Hardware-Adaptive Compute)
+## Latest: v0.78 (Edge Deployment)
 
 | Version | What It Adds | Params | Accuracy |
 |---|---|---|---|
@@ -10,6 +10,7 @@ A neural program executor that learns to run programs through latent reasoning, 
 | v0.75 | Length generalization (sinusoidal encoding, noise injection) | ~421K | 99%+ ID, tested to 16 steps |
 | v0.76 | Mixture of Recursions (adaptive inner depth per step) | ~445K | 99%+ with depth hierarchy |
 | v0.77 | Elastic inference (25-100% width, 1-4 depth, auto-config) | ~447K | 100% full, 98.5% at 50% width |
+| v0.78 | Edge deployment (ONNX export, INT8 quantization, benchmarks) | ~447K | INT8 within 1% of FP32 |
 
 ## What It Does
 
@@ -28,7 +29,7 @@ Programs can mix operations from any family.
 
 ## Architecture
 
-Six core capabilities:
+Seven core capabilities:
 
 1. **Latent Program Induction** -- the model generates its own internal instructions (96-dim latent vectors) at runtime, conditioned on the current state. This is runtime program synthesis, not pattern matching.
 
@@ -41,6 +42,8 @@ Six core capabilities:
 5. **Mixture of Recursions** (v0.76) -- within each solver step, shared weights can iterate 1-4 times. A learned router selects depth based on operation complexity.
 
 6. **Elastic Inference** (v0.77) -- one training run produces a model that runs at 25/50/75/100% width and 1-4 recursion depth. A device profiler auto-selects the largest config within a latency target. Matryoshka-style weight slicing, SwitchableLayerNorm, cascaded self-distillation, and depth distillation enable deployment from microcontrollers to full GPU.
+
+7. **Edge Deployment** (v0.78) -- exports the trained model to ONNX with INT8 quantization for deployment on Raspberry Pi, phones, and microcontrollers. Static inference wrappers freeze dynamic control flow, weight slicing, and SwitchableLayerNorm dispatch into ONNX-compatible graphs.
 
 ```
 Input: initial_state (x, y, z) + program [op1, op2, ..., opN]
@@ -113,7 +116,11 @@ Elastic Inference:
 ## Usage
 
 ```bash
-# Latest (v0.77 - Elastic Inference)
+# Latest (v0.78 - Edge Deployment)
+pip install onnx onnxruntime
+python BroadMind_v078_edge.py
+
+# v0.77 (Elastic Inference - trains from scratch)
 python BroadMind_v077_elastic.py
 
 # v0.76 (Mixture of Recursions)
@@ -126,7 +133,7 @@ python BroadMind_v075_scaling.py
 python BroadMind_v074_complete.py
 ```
 
-Each script trains from scratch and saves a checkpoint.
+v0.78 loads the v0.77 checkpoint (trains v0.77 first if no checkpoint exists), then exports ONNX models and INT8 quantized variants to `v078_edge_artifacts/`.
 
 ## Roadmap
 
@@ -135,10 +142,25 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan:
 - **v0.75** -- Task Scaling (length generalization) -- DONE
 - **v0.76** -- Mixture of Recursions (adaptive inner depth) -- DONE
 - **v0.77** -- Hardware-Adaptive Compute (elastic inference) -- DONE
-- **v0.78** -- Edge Deployment: run on Raspberry Pi, phones, microcontrollers
+- **v0.78** -- Edge Deployment (ONNX + INT8 quantization) -- DONE
+
+## Integration: BroadMind x Causeway
+
+BroadMind integrates with [Causeway](https://github.com/ElnurIbrahimov/causeway), a lightweight causal counterfactual reasoning adapter for frozen Transformers. The combined system (1.3M params total) pairs BroadMind's latent program execution with Causeway's causal consequence prediction.
+
+- **Causeway** answers: "What would change if I did X?" (structured delta vectors via Pearl's do-operator)
+- **BroadMind** answers: "How do I execute this program?" (latent program induction with adaptive compute)
+
+The integration module converts Causeway's learned causal DAG into BroadMind-compatible wisdom codes via a `CausalWisdomBridge`, then fuses causal wisdom with BroadMind's matched wisdom through a learned gate. BroadMind's solver generates latent programs that are causally informed — it knows what will change before it acts.
+
+Bridge overhead: 60K parameters (4.6% of combined system).
+
+See [BroadMindxCauseway](https://github.com/ElnurIbrahimov/BroadMindxCauseway) for the full integration module and documentation.
 
 ## Requirements
 
 - Python 3.8+
 - PyTorch
 - NumPy
+- `onnx` (for v0.78 edge deployment)
+- `onnxruntime` (for v0.78 edge deployment)
