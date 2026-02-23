@@ -59,12 +59,11 @@ class Config:
     halt_threshold = 0.5
 
     # Training iterations per phase
-    n_iterations_phase1 = 2500   # MetaWisdom only, 4 named families, per-op wisdom
-    n_iterations_phase2 = 2500   # Joint solver+MetaWisdom, 4 named families
-    n_iterations_phase3 = 3000   # Diversity: 50% named + 50% procedural ops
-    n_iterations_phase4 = 800    # Halter only
-    n_iterations_phase5 = 1500   # End-to-end (named + procedural)
-    n_iterations_phase6 = 1000   # Length generalization + noise
+    n_iterations_phase1 = 3000   # MetaWisdom + wisdom_to_op, named families, anchoring
+    n_iterations_phase2 = 4000   # Joint all, named + procedural, diversity phase
+    n_iterations_phase3 = 800    # Halter only
+    n_iterations_phase4 = 1500   # End-to-end (named + procedural)
+    n_iterations_phase5 = 1000   # Length generalization + noise
 
     # Procedural ops
     procedural_prob = 0.5        # fraction of Phase 3/5 batches using procedural ops
@@ -1115,14 +1114,33 @@ def load_v077_checkpoint(model, checkpoint_path):
     # Load into model
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
 
-    # Initialize wisdom_to_op: bias = mean of real op embeddings, weights = 0
-    # This way NOVEL tokens produce "average op" features before training
+    # Initialize wisdom_to_op with least-squares fit from v0.77 data
+    # CRITICAL: weight MUST be non-zero for gradient flow in Phase 1!
     with torch.no_grad():
-        real_op_embs = model.solver.op_embedding.weight[:PAD_IDX]  # exclude PAD/NOVEL
-        mean_op = real_op_embs.mean(dim=0)
-        model.solver.wisdom_to_op.bias.data.copy_(mean_op)
-        nn.init.zeros_(model.solver.wisdom_to_op.weight)
-    print("  [INIT] wisdom_to_op: bias=mean_op_embedding, weight=zeros")
+        real_op_embs = model.solver.op_embedding.weight[:PAD_IDX]  # (12, 192)
+
+        if old_wisdom_codes is not None and old_wisdom_codes.shape[0] >= 4:
+            # Least-squares: map v0.77 wisdom codes → mean family op embeddings
+            target_embs = []
+            for f in range(min(4, old_wisdom_codes.shape[0])):
+                fam_embs = real_op_embs[f*3:(f+1)*3]
+                target_embs.append(fam_embs.mean(dim=0))
+            Y = torch.stack(target_embs)      # (4, 192)
+            X = old_wisdom_codes[:4].to(Y.device)  # (4, 48)
+
+            b = Y.mean(0)                     # (192,)
+            Y_centered = Y - b
+            # Solve: Y_centered = X @ W_T  for W_T (48, 192)
+            W_T = torch.linalg.lstsq(X, Y_centered).solution
+            model.solver.wisdom_to_op.weight.data.copy_(W_T.T)  # (192, 48)
+            model.solver.wisdom_to_op.bias.data.copy_(b)
+            print("  [INIT] wisdom_to_op: least-squares fit from v0.77 wisdom->op_emb")
+        else:
+            # Fallback: Xavier init (non-zero!) + mean_op bias
+            mean_op = real_op_embs.mean(dim=0)
+            nn.init.xavier_normal_(model.solver.wisdom_to_op.weight, gain=0.1)
+            model.solver.wisdom_to_op.bias.data.copy_(mean_op)
+            print("  [INIT] wisdom_to_op: xavier(0.1) + mean_op bias")
 
     # Filter expected missing/unexpected keys
     unexpected_missing = [k for k in missing
@@ -1185,13 +1203,15 @@ def _compute_anchor_loss(model, batch, old_wisdom_codes, iteration):
 
 
 def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
-    """Phase 1: MetaWisdom only, 4 named families, per-op wisdom, anchoring.
+    """Phase 1: MetaWisdom + wisdom_to_op, 4 named families, anchoring.
 
-    Solver frozen. MetaWisdom learns to produce wisdom that makes the
-    frozen solver work when using wisdom_to_op (instead of op_embedding).
+    Rest of solver frozen. wisdom_to_op is trainable so gradients flow
+    from task_loss through wisdom_to_op to MetaWisdomEncoder.
     """
     model.meta_wisdom.train()
     model.solver.eval()
+    # Keep wisdom_to_op in training mode (it's in the optimizer)
+    model.solver.wisdom_to_op.train()
     model.halter.eval()
     optimizer.zero_grad()
 
@@ -1234,61 +1254,11 @@ def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
     return task_loss.item(), anchor_loss.item()
 
 
-def train_phase2_joint(model, optimizer, old_wisdom_codes, iteration):
-    """Phase 2: Joint solver + MetaWisdom, 4 named families.
+def train_phase2_joint_diversity(model, optimizer, old_wisdom_codes, iteration):
+    """Phase 2: Joint all + procedural diversity. Meta-learning emerges here.
 
-    Solver re-learns to use wisdom_to_op features (instead of memorized op_embedding).
-    Weaker anchoring — let wisdom evolve toward what the solver actually needs.
-    """
-    model.meta_wisdom.train()
-    model.solver.train()
-    model.halter.eval()
-    optimizer.zero_grad()
-
-    batch = generate_batch(config.batch_size, min_len=1, max_len=4,
-                           families=TRAIN_FAMILIES, mixed_prob=0.5)
-
-    programs = batch['program_indices']
-    initial_states = batch['initial_states']
-    intermediate = batch['intermediate']
-    lengths = batch['lengths']
-    max_steps = programs.shape[1]
-
-    per_step_wisdom = compute_batch_wisdom(
-        model, batch['op_names'], max_steps, aggregate_only=True)
-
-    preds, _, compute_cost = model.solver(programs, initial_states, per_step_wisdom)
-    task_loss = _compute_task_loss(preds, intermediate, lengths)
-
-    # Weaker anchoring (half weight)
-    anchor_loss = torch.tensor(0.0, device=config.device)
-    if old_wisdom_codes is not None:
-        anchor_w = 0.5 * config.anchor_weight * (config.anchor_decay ** iteration)
-        family_ids = batch['family_ids']
-        for fam_id in range(config.n_train_families):
-            fam_mask = (family_ids == fam_id)
-            if fam_mask.sum() == 0:
-                continue
-            fam_w = per_step_wisdom[fam_mask].mean(dim=(0, 1))
-            target = old_wisdom_codes[fam_id]
-            anchor_loss = anchor_loss + F.mse_loss(fam_w, target)
-        anchor_loss = anchor_w * anchor_loss / max(config.n_train_families, 1)
-
-    cost_loss = config.compute_cost_weight * compute_cost
-    loss = task_loss + anchor_loss + cost_loss
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-    optimizer.step()
-
-    return task_loss.item(), anchor_loss.item()
-
-
-def train_phase3_diversity(model, optimizer):
-    """Phase 3: 50% named + 50% procedural ops. The diversity phase.
-
-    This is where meta-learning generalization emerges. Procedural ops
-    force MetaWisdomEncoder to extract general transformation semantics.
-    No anchoring — wisdom finds its own space.
+    50% named families + 50% procedural ops. Weaker anchoring that decays.
+    Procedural diversity forces MetaWisdomEncoder to learn general features.
     """
     model.meta_wisdom.train()
     model.solver.train()
@@ -1314,9 +1284,23 @@ def train_phase3_diversity(model, optimizer):
 
     preds, _, compute_cost = model.solver(programs, initial_states, per_step_wisdom)
     task_loss = _compute_task_loss(preds, intermediate, lengths)
-    cost_loss = config.compute_cost_weight * compute_cost
-    loss = task_loss + cost_loss
 
+    # Weak anchoring on named batches only, decays over time
+    anchor_loss = torch.tensor(0.0, device=config.device)
+    if not use_procedural and old_wisdom_codes is not None:
+        anchor_w = 0.3 * config.anchor_weight * (config.anchor_decay ** iteration)
+        family_ids = batch['family_ids']
+        for fam_id in range(config.n_train_families):
+            fam_mask = (family_ids == fam_id)
+            if fam_mask.sum() == 0:
+                continue
+            fam_w = per_step_wisdom[fam_mask].mean(dim=(0, 1))
+            target = old_wisdom_codes[fam_id]
+            anchor_loss = anchor_loss + F.mse_loss(fam_w, target)
+        anchor_loss = anchor_w * anchor_loss / max(config.n_train_families, 1)
+
+    cost_loss = config.compute_cost_weight * compute_cost
+    loss = task_loss + anchor_loss + cost_loss
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
     optimizer.step()
@@ -1324,7 +1308,7 @@ def train_phase3_diversity(model, optimizer):
     return task_loss.item(), use_procedural
 
 
-def train_phase4_halter(model, optimizer):
+def train_phase3_halter(model, optimizer):
     """Phase 4: Halter only."""
     model.halter.train()
     model.solver.eval()
@@ -1352,7 +1336,7 @@ def train_phase4_halter(model, optimizer):
     return total_loss.item()
 
 
-def train_phase5_e2e(model, optimizer):
+def train_phase4_e2e(model, optimizer):
     """Phase 5: End-to-end with named + procedural ops."""
     model.train()
     optimizer.zero_grad()
@@ -1392,7 +1376,7 @@ def train_phase5_e2e(model, optimizer):
     return task_loss.item(), halt_loss.item()
 
 
-def train_phase6_lengthgen(model, optimizer, iteration, total_iterations):
+def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
     """Phase 6: Length generalization with noise."""
     model.solver.train()
     model.meta_wisdom.train()
@@ -1657,13 +1641,15 @@ def main():
 
     start_time = time.time()
 
-    # ---- Phase 1: MetaWisdom only, 4 named families ----
+    # ---- Phase 1: MetaWisdom + wisdom_to_op, named families ----
     print("=" * 70)
-    print(f"Phase 1: MetaWisdomEncoder ({config.n_iterations_phase1} iters)")
-    print("  Per-op wisdom, solver frozen, strong anchoring")
-    print("  Solver uses wisdom_to_op ALWAYS (no op_embedding)")
+    print(f"Phase 1: MetaWisdom + wisdom_to_op ({config.n_iterations_phase1} iters)")
+    print("  Per-op wisdom, rest of solver frozen, anchoring")
+    print("  wisdom_to_op trained jointly (non-zero init = gradients flow!)")
     print("=" * 70)
-    optimizer = torch.optim.AdamW(model.meta_wisdom.parameters(),
+    phase1_params = (list(model.meta_wisdom.parameters()) +
+                     [model.solver.wisdom_to_op.weight, model.solver.wisdom_to_op.bias])
+    optimizer = torch.optim.AdamW(phase1_params,
                                   lr=config.lr, weight_decay=config.weight_decay)
     for i in range(config.n_iterations_phase1):
         task_loss, anchor_loss = train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, i)
@@ -1674,86 +1660,70 @@ def main():
     p1_acc = evaluate_solver_only(model, n_batches=10)
     print(f"\n  Phase 1 done: acc = {p1_acc:.1f}%")
 
-    # ---- Phase 2: Joint solver + MetaWisdom, 4 named families ----
+    # ---- Phase 2: Joint + Diversity (50% named + 50% procedural) ----
     print()
     print("=" * 70)
-    print(f"Phase 2: Joint solver+MetaWisdom ({config.n_iterations_phase2} iters)")
-    print("  Solver re-learns with wisdom_to_op features, weaker anchoring")
-    print("=" * 70)
-    optimizer = torch.optim.AdamW(
-        list(model.meta_wisdom.parameters()) + list(model.solver.parameters()),
-        lr=config.lr_joint, weight_decay=config.weight_decay)
-    for i in range(config.n_iterations_phase2):
-        task_loss, anchor_loss = train_phase2_joint(model, optimizer, old_wisdom_codes, i)
-        if (i + 1) % 300 == 0:
-            acc = evaluate_solver_only(model, n_batches=5)
-            print(f"  P2 [{i+1:4d}/{config.n_iterations_phase2}] "
-                  f"task={task_loss:.4f} anchor={anchor_loss:.4f} acc={acc:.1f}%")
-    p2_acc = evaluate_solver_only(model, n_batches=10)
-    print(f"\n  Phase 2 done: acc = {p2_acc:.1f}%")
-
-    # ---- Phase 3: Diversity (50% named + 50% procedural) ----
-    print()
-    print("=" * 70)
-    print(f"Phase 3: Diversity ({config.n_iterations_phase3} iters)")
-    print("  50% named + 50% procedural ops -- meta-learning emerges here")
+    print(f"Phase 2: Joint + Diversity ({config.n_iterations_phase2} iters)")
+    print("  50% named + 50% procedural ops, weak anchoring")
+    print("  Meta-learning generalization emerges here")
     print("=" * 70)
     optimizer = torch.optim.AdamW(
         list(model.meta_wisdom.parameters()) + list(model.solver.parameters()),
         lr=config.lr_joint, weight_decay=config.weight_decay)
     proc_count = 0
-    for i in range(config.n_iterations_phase3):
-        task_loss, used_proc = train_phase3_diversity(model, optimizer)
+    for i in range(config.n_iterations_phase2):
+        task_loss, used_proc = train_phase2_joint_diversity(
+            model, optimizer, old_wisdom_codes, i)
         if used_proc:
             proc_count += 1
-        if (i + 1) % 300 == 0:
+        if (i + 1) % 400 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
-            print(f"  P3 [{i+1:4d}/{config.n_iterations_phase3}] "
+            print(f"  P2 [{i+1:4d}/{config.n_iterations_phase2}] "
                   f"task={task_loss:.4f} proc={proc_count}/{i+1} acc={acc:.1f}%")
-    p3_acc = evaluate_solver_only(model, n_batches=10)
-    print(f"\n  Phase 3 done: acc = {p3_acc:.1f}% (procedural batches: {proc_count})")
+    p2_acc = evaluate_solver_only(model, n_batches=10)
+    print(f"\n  Phase 2 done: acc = {p2_acc:.1f}% (procedural: {proc_count}/{config.n_iterations_phase2})")
 
-    # ---- Phase 4: Halter ----
+    # ---- Phase 3: Halter ----
     print()
     print("=" * 70)
-    print(f"Phase 4: Halter ({config.n_iterations_phase4} iters)")
+    print(f"Phase 3: Halter ({config.n_iterations_phase3} iters)")
     print("=" * 70)
     optimizer = torch.optim.AdamW(model.halter.parameters(),
                                   lr=config.lr, weight_decay=config.weight_decay)
-    for i in range(config.n_iterations_phase4):
-        halt_loss = train_phase4_halter(model, optimizer)
+    for i in range(config.n_iterations_phase3):
+        halt_loss = train_phase3_halter(model, optimizer)
         if (i + 1) % 200 == 0:
-            print(f"  P4 [{i+1:4d}/{config.n_iterations_phase4}] halt_loss={halt_loss:.4f}")
+            print(f"  P3 [{i+1:4d}/{config.n_iterations_phase3}] halt_loss={halt_loss:.4f}")
 
-    # ---- Phase 5: End-to-end ----
+    # ---- Phase 4: End-to-end ----
     print()
     print("=" * 70)
-    print(f"Phase 5: End-to-end ({config.n_iterations_phase5} iters)")
+    print(f"Phase 4: End-to-end ({config.n_iterations_phase4} iters)")
     print("  All components, named + procedural ops")
     print("=" * 70)
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=config.lr_fine, weight_decay=config.weight_decay)
-    for i in range(config.n_iterations_phase5):
-        task_loss, halt_loss = train_phase5_e2e(model, optimizer)
+    for i in range(config.n_iterations_phase4):
+        task_loss, halt_loss = train_phase4_e2e(model, optimizer)
         if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
-            print(f"  P5 [{i+1:4d}/{config.n_iterations_phase5}] "
+            print(f"  P4 [{i+1:4d}/{config.n_iterations_phase4}] "
                   f"task={task_loss:.4f} halt={halt_loss:.4f} acc={acc:.1f}%")
 
-    # ---- Phase 6: Length generalization ----
+    # ---- Phase 5: Length generalization ----
     print()
     print("=" * 70)
-    print(f"Phase 6: Length generalization ({config.n_iterations_phase6} iters)")
+    print(f"Phase 5: Length generalization ({config.n_iterations_phase5} iters)")
     print("  Solver + MetaWisdom, noise injection")
     print("=" * 70)
     optimizer = torch.optim.AdamW(
         list(model.solver.parameters()) + list(model.meta_wisdom.parameters()),
         lr=config.lr_fine, weight_decay=config.weight_decay)
-    for i in range(config.n_iterations_phase6):
-        task_loss, cons_loss, noise = train_phase6_lengthgen(
-            model, optimizer, i, config.n_iterations_phase6)
+    for i in range(config.n_iterations_phase5):
+        task_loss, cons_loss, noise = train_phase5_lengthgen(
+            model, optimizer, i, config.n_iterations_phase5)
         if (i + 1) % 200 == 0:
-            print(f"  P6 [{i+1:4d}/{config.n_iterations_phase6}] "
+            print(f"  P5 [{i+1:4d}/{config.n_iterations_phase5}] "
                   f"task={task_loss:.4f} cons={cons_loss:.4f} noise={noise:.3f}")
 
     elapsed = time.time() - start_time
