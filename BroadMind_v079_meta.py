@@ -61,7 +61,7 @@ class Config:
 
     # Training iterations per phase
     n_iterations_phase1 = 3000   # MetaWisdomEncoder only, aggregate mode, no NOVEL
-    n_iterations_phase1b = 1500  # Solver learns NOVEL dependency (MetaWisdom frozen)
+    n_iterations_phase1b = 2000  # Solver + wisdom_to_op learn NOVEL dependency
     n_iterations_phase2 = 2000   # Joint: MetaWisdom (cross-attn) + Solver, NOVEL ramp
     n_iterations_phase3 = 800    # Halter only
     n_iterations_phase4 = 2000   # End-to-end
@@ -513,14 +513,18 @@ class MetaWisdomEncoder(nn.Module):
 
 class ElasticSolver(nn.Module):
     """Wisdom-guided program executor with MoR and elastic width/depth.
-    Identical to v0.77 ElasticSolver. Only runs at full width in v0.79.
+
+    v0.79 addition: wisdom_to_op projection. When op_idx == NOVEL_IDX,
+    uses wisdom_to_op(wisdom) instead of op_embedding(NOVEL) everywhere
+    (router, latent gen). This lets wisdom effectively replace op identity
+    for novel operations.
     """
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         d = config.d_model
-        width_multipliers = [1.0]  # v0.79 only uses full width
+        width_multipliers = [1.0]
 
         # State encoder
         self.state_enc_linear = nn.Linear(config.n_variables, d)
@@ -529,7 +533,11 @@ class ElasticSolver(nn.Module):
         # Op embedding (includes NOVEL token)
         self.op_embedding = nn.Embedding(N_OPS, d)
 
-        # Wisdom encoder
+        # Wisdom-to-op projection: maps 48D wisdom → 192D op-embedding space
+        # Used instead of op_embedding when op is NOVEL
+        self.wisdom_to_op = nn.Linear(config.d_wisdom, d)
+
+        # Wisdom encoder (for latent gen — separate from wisdom_to_op)
         self.wisdom_enc_linear = nn.Linear(config.d_wisdom, d // 2)
 
         # Recursion router
@@ -581,8 +589,12 @@ class ElasticSolver(nn.Module):
         batch_size = state.shape[0]
         d = self.config.d_model
 
-        # Fixed encodings
-        op_enc = self.op_embedding(op_idx)
+        # Gated op encoding: use wisdom_to_op for NOVEL, real embedding otherwise
+        op_emb = self.op_embedding(op_idx)
+        is_novel = (op_idx == NOVEL_IDX).unsqueeze(-1)  # (batch, 1)
+        wisdom_op = self.wisdom_to_op(wisdom)            # (batch, d_model)
+        op_enc = torch.where(is_novel, wisdom_op, op_emb)
+
         step_enc = sinusoidal_step_encoding(step_num, d // 4, batch_size, state.device)
         wisdom_enc = F.gelu(self.wisdom_enc_linear(wisdom))
 
@@ -880,8 +892,19 @@ def load_v077_checkpoint(model, checkpoint_path):
     # Load into model
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
 
+    # Initialize wisdom_to_op: bias = mean of real op embeddings, weights = 0
+    # This way NOVEL tokens produce "average op" features before training
+    with torch.no_grad():
+        real_op_embs = model.solver.op_embedding.weight[:PAD_IDX]  # exclude PAD/NOVEL
+        mean_op = real_op_embs.mean(dim=0)
+        model.solver.wisdom_to_op.bias.data.copy_(mean_op)
+        nn.init.zeros_(model.solver.wisdom_to_op.weight)
+    print("  [INIT] wisdom_to_op: bias=mean_op_embedding, weight=zeros")
+
     # Filter expected missing/unexpected keys
-    unexpected_missing = [k for k in missing if not k.startswith('meta_wisdom.')]
+    unexpected_missing = [k for k in missing
+                          if not k.startswith('meta_wisdom.')
+                          and 'wisdom_to_op' not in k]
     # Junction column buffers from v0.77 elastic width are expected unexpected
     truly_unexpected = [k for k in unexpected if not k.endswith(('_cols_w25', '_cols_w50', '_cols_w75', '_cols_w100'))]
 
