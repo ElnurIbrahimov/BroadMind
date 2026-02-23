@@ -1,22 +1,22 @@
 """
-BroadMind v0.79: Meta-Learning Wisdom (FluxMind Integration)
-=============================================================
+BroadMind v0.79d: Meta-Learning Wisdom (FluxMind Integration)
+==============================================================
 Proprietary - Elnur Ibrahimov
 February 2026
 
-Replaces static wisdom (WisdomBank + WisdomDistiller + WisdomMatcher) with
-MetaWisdomEncoder — a cross-attention module that generates 48D wisdom from
-K=16 demonstration transitions at inference time.
+v0.79d key insight: the solver ALWAYS uses wisdom_to_op(wisdom) for op encoding.
+No op_embedding at inference. The solver is wisdom-dependent BY CONSTRUCTION.
+Combined with procedural op diversity during training, this enables true
+meta-learning generalization to novel operations.
 
-Key changes from v0.77:
-- MetaWisdomEncoder (~95K params) replaces WisdomBank + WisdomDistiller + WisdomMatcher (~126K)
-- 6 novel operation families (SWAP, MIRROR, DOUBLE, MIN_MAX, MODULAR, COND_TRANSFER)
-- NOVEL op token: solver learns to rely on wisdom when op identity is masked
-- Wisdom anchoring loss bootstraps MetaWisdomEncoder from v0.77 wisdom codes
-- ~416K params total (down from 447K)
+Architecture:
+- MetaWisdomEncoder generates per-OP 48D wisdom from K=16 demo transitions
+- Per-step wisdom: each program step gets its own wisdom from its op's demos
+- wisdom_to_op(wisdom) replaces op_embedding everywhere in the solver
+- ProceduralOp generator provides training diversity (50+ random op types)
 
 Loads solver + halter from v0.77 checkpoint, trains MetaWisdomEncoder on top.
-Self-contained: run on RunPod with RTX 5090 (~35 min).
+Self-contained: run on RunPod with RTX 5090 (~45 min).
 """
 
 import math
@@ -51,21 +51,23 @@ class Config:
     d_demo = 96           # demo embedding dim
 
     # Meta-wisdom
-    n_support = 16        # K=16 support transitions
+    n_support = 16        # K=16 support transitions per op
     n_cross_heads = 4     # cross-attention heads
     cross_head_dim = 24   # head_dim for cross-attention (4 * 24 = 96 = d_demo)
-    novel_mask_rate = 0.3 # fraction of op embeddings replaced with NOVEL during training
 
     # Halting
     halt_threshold = 0.5
 
     # Training iterations per phase
-    n_iterations_phase1 = 3000   # MetaWisdomEncoder only, aggregate mode, no NOVEL
-    n_iterations_phase1b = 2000  # Solver + wisdom_to_op learn NOVEL dependency
-    n_iterations_phase2 = 2000   # Joint: MetaWisdom (cross-attn) + Solver, NOVEL ramp
-    n_iterations_phase3 = 800    # Halter only
-    n_iterations_phase4 = 2000   # End-to-end
-    n_iterations_phase5 = 1000   # Length generalization + noise
+    n_iterations_phase1 = 2500   # MetaWisdom only, 4 named families, per-op wisdom
+    n_iterations_phase2 = 2500   # Joint solver+MetaWisdom, 4 named families
+    n_iterations_phase3 = 3000   # Diversity: 50% named + 50% procedural ops
+    n_iterations_phase4 = 800    # Halter only
+    n_iterations_phase5 = 1500   # End-to-end (named + procedural)
+    n_iterations_phase6 = 1000   # Length generalization + noise
+
+    # Procedural ops
+    procedural_prob = 0.5        # fraction of Phase 3/5 batches using procedural ops
 
     # Training hyperparams
     batch_size = 256
@@ -133,6 +135,7 @@ PAD_IDX = TRAIN_OPS.index('PAD')
 NOVEL_IDX = TRAIN_OPS.index('NOVEL')
 N_OPS = len(TRAIN_OPS)
 OP_TO_IDX = {op: i for i, op in enumerate(TRAIN_OPS)}
+IDX_TO_OP = {i: op for op, i in OP_TO_IDX.items()}
 
 # Novel ops get separate list (not in the embedding table)
 NOVEL_OPS = []
@@ -144,6 +147,87 @@ def get_family_id(op_name):
         if op_name in fam['ops']:
             return fam_id
     return -1
+
+# ============================================================================
+# PROCEDURAL OPERATIONS (random parameterized ops for training diversity)
+# ============================================================================
+
+class ProceduralOp:
+    """A randomly parameterized operation on 3-variable states.
+
+    Provides training diversity so MetaWisdomEncoder learns general
+    transformation semantics instead of classifying into 4 buckets.
+    18 op types x 3 sources x 3 targets x params = 500+ unique ops.
+    """
+    OP_TYPES = [
+        'add_const', 'sub_const', 'set_const',
+        'copy', 'add_vars', 'sub_vars',
+        'min_vars', 'max_vars',
+        'negate', 'double', 'halve',
+        'clamp_high', 'clamp_low',
+        'cond_inc', 'cond_dec',
+        'swap', 'mirror', 'modular',
+    ]
+
+    def __init__(self):
+        self.op_type = random.choice(self.OP_TYPES)
+        self.source = random.randint(0, 2)
+        self.target = random.randint(0, 2)
+        self.source2 = random.randint(0, 2)
+        self.param = random.randint(1, 5)
+        self.threshold = random.randint(3, 7)
+        self._id = id(self)
+
+    def execute(self, state):
+        vals = list(state)
+        src = vals[self.source]
+        src2 = vals[self.source2]
+        vr = config.value_range
+
+        if self.op_type == 'add_const':
+            vals[self.target] = min(src + self.param, vr)
+        elif self.op_type == 'sub_const':
+            vals[self.target] = max(src - self.param, 0)
+        elif self.op_type == 'set_const':
+            vals[self.target] = min(self.param, vr)
+        elif self.op_type == 'copy':
+            vals[self.target] = src
+        elif self.op_type == 'add_vars':
+            vals[self.target] = min(src + src2, vr)
+        elif self.op_type == 'sub_vars':
+            vals[self.target] = max(src - src2, 0)
+        elif self.op_type == 'min_vars':
+            vals[self.target] = min(src, src2)
+        elif self.op_type == 'max_vars':
+            vals[self.target] = max(src, src2)
+        elif self.op_type == 'negate':
+            vals[self.target] = vr - src
+        elif self.op_type == 'double':
+            vals[self.target] = min(2 * src, vr)
+        elif self.op_type == 'halve':
+            vals[self.target] = src // 2
+        elif self.op_type == 'clamp_high':
+            vals[self.target] = min(src, self.param)
+        elif self.op_type == 'clamp_low':
+            vals[self.target] = max(src, self.param)
+        elif self.op_type == 'cond_inc':
+            if src > self.threshold:
+                vals[self.target] = min(vals[self.target] + 1, vr)
+        elif self.op_type == 'cond_dec':
+            if src > self.threshold:
+                vals[self.target] = max(vals[self.target] - 1, 0)
+        elif self.op_type == 'swap':
+            vals[self.source], vals[self.target] = vals[self.target], vals[self.source]
+        elif self.op_type == 'mirror':
+            vals[self.target] = vr - src
+        elif self.op_type == 'modular':
+            vals[self.target] = src % max(src2, 1)
+        return tuple(vals)
+
+
+def generate_procedural_family(n_ops=3):
+    """Generate a family of n_ops random procedural operations."""
+    return [ProceduralOp() for _ in range(n_ops)]
 
 # ============================================================================
 # OPERATIONS (training + novel)
@@ -220,13 +304,12 @@ def sinusoidal_step_encoding(step_num, d, batch_size, device):
 # DATA GENERATION
 # ============================================================================
 
-def generate_batch(batch_size, min_len=1, max_len=4, families=None,
-                   mixed_prob=0.0, novel_mask_rate=0.0):
-    """Generate training batch. Works for both training and novel families.
+def generate_batch(batch_size, min_len=1, max_len=4, families=None, mixed_prob=0.0):
+    """Generate training batch with per-step op tracking.
 
-    For training families: op indices from OP_TO_IDX.
-    For novel families: op index = NOVEL_IDX (the solver sees NOVEL token).
-    novel_mask_rate: fraction of training ops randomly replaced with NOVEL.
+    Returns op_names: list of lists of op name strings (for per-op wisdom).
+    For training families: op indices from OP_TO_IDX (for halter).
+    For novel families: op index = NOVEL_IDX (halter just counts steps).
     """
     if families is None:
         families = TRAIN_FAMILIES
@@ -236,6 +319,7 @@ def generate_batch(batch_size, min_len=1, max_len=4, families=None,
     all_intermediate = []
     lengths = []
     family_ids = []
+    op_names_batch = []
 
     all_family_ops = []
     for fam in families.values():
@@ -256,24 +340,22 @@ def generate_batch(batch_size, min_len=1, max_len=4, families=None,
 
         init = tuple(np.random.randint(0, config.value_range) for _ in range(3))
 
-        # Get op indices for the solver
+        # Op indices for halter (solver uses wisdom instead)
         prog_idx = []
         for op in prog_ops:
             if op in OP_TO_IDX:
-                idx = OP_TO_IDX[op]
-                # Randomly mask training ops with NOVEL token
-                if novel_mask_rate > 0 and random.random() < novel_mask_rate:
-                    idx = NOVEL_IDX
-                prog_idx.append(idx)
+                prog_idx.append(OP_TO_IDX[op])
             else:
-                # Novel op — solver sees NOVEL token
                 prog_idx.append(NOVEL_IDX)
 
         states = execute_program(init, prog_ops)
 
-        # Pad
+        # Pad ops and op_names
+        full_ops = list(prog_ops)
         while len(prog_idx) < max_len:
             prog_idx.append(PAD_IDX)
+        while len(full_ops) < max_len:
+            full_ops.append('PAD')
 
         intermediate = list(states[1:])
         while len(intermediate) < max_len:
@@ -284,6 +366,7 @@ def generate_batch(batch_size, min_len=1, max_len=4, families=None,
         all_intermediate.append(intermediate)
         lengths.append(prog_len)
         family_ids.append(family_id)
+        op_names_batch.append(full_ops)
 
     return {
         'program_indices': torch.tensor(program_indices, dtype=torch.long, device=config.device),
@@ -291,6 +374,7 @@ def generate_batch(batch_size, min_len=1, max_len=4, families=None,
         'intermediate': torch.tensor(all_intermediate, dtype=torch.float, device=config.device),
         'lengths': torch.tensor(lengths, dtype=torch.long, device=config.device),
         'family_ids': torch.tensor(family_ids, dtype=torch.long, device=config.device),
+        'op_names': op_names_batch,
     }
 
 
@@ -335,6 +419,147 @@ def generate_support_batch(families, batch_size, n_support=16):
         all_states.append(s)
         all_next.append(ns)
     return torch.stack(all_states), torch.stack(all_next)
+
+
+def generate_per_op_support(op_name, n_support=16):
+    """Generate K demo transitions for one specific named op."""
+    states_list, next_list = [], []
+    for _ in range(n_support):
+        init = tuple(np.random.randint(0, config.value_range) for _ in range(3))
+        result = execute_op(init, op_name)
+        states_list.append(init)
+        next_list.append(result)
+    return (
+        torch.tensor(states_list, dtype=torch.float, device=config.device),
+        torch.tensor(next_list, dtype=torch.float, device=config.device),
+    )
+
+
+def generate_procedural_support(proc_op, n_support=16):
+    """Generate K demo transitions for one procedural op."""
+    states_list, next_list = [], []
+    for _ in range(n_support):
+        init = tuple(np.random.randint(0, config.value_range) for _ in range(3))
+        result = proc_op.execute(init)
+        states_list.append(init)
+        next_list.append(result)
+    return (
+        torch.tensor(states_list, dtype=torch.float, device=config.device),
+        torch.tensor(next_list, dtype=torch.float, device=config.device),
+    )
+
+
+def generate_procedural_batch(batch_size, min_len=1, max_len=4, n_ops=3):
+    """Generate batch using random procedural operations.
+
+    All ops use NOVEL_IDX for halter. op_names are ProceduralOp objects.
+    A fresh procedural family (n_ops random ops) is created per call.
+    """
+    proc_ops = generate_procedural_family(n_ops)
+
+    program_indices = []
+    initial_states = []
+    all_intermediate = []
+    lengths = []
+    op_names_batch = []
+
+    for _ in range(batch_size):
+        prog_len = random.randint(min_len, max_len)
+        step_ops = [random.choice(proc_ops) for _ in range(prog_len)]
+
+        init = tuple(np.random.randint(0, config.value_range) for _ in range(3))
+
+        # Execute procedural program
+        state = init
+        states = []
+        for op in step_ops:
+            state = op.execute(state)
+            states.append(state)
+
+        # All ops are NOVEL for halter
+        prog_idx = [NOVEL_IDX] * prog_len
+        while len(prog_idx) < max_len:
+            prog_idx.append(PAD_IDX)
+
+        intermediate = list(states)
+        while len(intermediate) < max_len:
+            intermediate.append(intermediate[-1])
+
+        # Pad op_names with last op (for padded steps)
+        full_ops = list(step_ops)
+        while len(full_ops) < max_len:
+            full_ops.append(step_ops[-1])
+
+        program_indices.append(prog_idx)
+        initial_states.append(init)
+        all_intermediate.append(intermediate)
+        lengths.append(prog_len)
+        op_names_batch.append(full_ops)
+
+    return {
+        'program_indices': torch.tensor(program_indices, dtype=torch.long, device=config.device),
+        'initial_states': torch.tensor(initial_states, dtype=torch.float, device=config.device),
+        'intermediate': torch.tensor(all_intermediate, dtype=torch.float, device=config.device),
+        'lengths': torch.tensor(lengths, dtype=torch.long, device=config.device),
+        'op_names': op_names_batch,
+    }
+
+
+def compute_batch_wisdom(model, op_names_batch, max_steps, aggregate_only=True):
+    """Compute per-step wisdom for a batch by generating per-op support.
+
+    Efficiently batches all unique ops into one MetaWisdomEncoder forward pass.
+
+    Args:
+        op_names_batch: list of lists of (str or ProceduralOp)
+        max_steps: number of steps per program
+        aggregate_only: use mean-pool (True) or cross-attention (False)
+
+    Returns: (batch_size, max_steps, d_wisdom)
+    """
+    batch_size = len(op_names_batch)
+
+    # Collect unique ops
+    unique_ops = {}
+    for ops in op_names_batch:
+        for op in ops:
+            key = op if isinstance(op, str) else op._id
+            if key not in unique_ops:
+                unique_ops[key] = op
+
+    # Generate support for each unique op
+    all_demo_s, all_demo_ns = [], []
+    key_order = list(unique_ops.keys())
+
+    for key in key_order:
+        op = unique_ops[key]
+        if isinstance(op, str):
+            s, ns = generate_per_op_support(op, config.n_support)
+        else:
+            s, ns = generate_procedural_support(op, config.n_support)
+        all_demo_s.append(s)
+        all_demo_ns.append(ns)
+
+    all_demo_s = torch.stack(all_demo_s)     # (n_unique, K, 3)
+    all_demo_ns = torch.stack(all_demo_ns)   # (n_unique, K, 3)
+    dummy_states = torch.zeros(len(key_order), 3, device=config.device)
+
+    # One forward pass for all unique ops
+    all_wisdoms = model.meta_wisdom(
+        dummy_states, all_demo_s, all_demo_ns, aggregate_only=aggregate_only
+    )  # (n_unique, d_wisdom)
+
+    # Assign per-step wisdom
+    key_to_idx = {k: i for i, k in enumerate(key_order)}
+    wisdoms = torch.zeros(batch_size, max_steps, config.d_wisdom, device=config.device)
+
+    for b in range(batch_size):
+        for t in range(min(len(op_names_batch[b]), max_steps)):
+            op = op_names_batch[b][t]
+            key = op if isinstance(op, str) else op._id
+            wisdoms[b, t] = all_wisdoms[key_to_idx[key]]
+
+    return wisdoms
 
 # ============================================================================
 # SWITCHABLE LAYER NORM (from v0.77)
@@ -514,10 +739,10 @@ class MetaWisdomEncoder(nn.Module):
 class ElasticSolver(nn.Module):
     """Wisdom-guided program executor with MoR and elastic width/depth.
 
-    v0.79 addition: wisdom_to_op projection. When op_idx == NOVEL_IDX,
-    uses wisdom_to_op(wisdom) instead of op_embedding(NOVEL) everywhere
-    (router, latent gen). This lets wisdom effectively replace op identity
-    for novel operations.
+    v0.79d: solver ALWAYS uses wisdom_to_op(wisdom) for op encoding.
+    op_embedding is kept for initialization but NOT used during forward pass.
+    This makes the solver wisdom-dependent by construction — it MUST learn
+    to interpret wisdom-derived features for any operation.
     """
 
     def __init__(self, config):
@@ -589,11 +814,9 @@ class ElasticSolver(nn.Module):
         batch_size = state.shape[0]
         d = self.config.d_model
 
-        # Gated op encoding: use wisdom_to_op for NOVEL, real embedding otherwise
-        op_emb = self.op_embedding(op_idx)
-        is_novel = (op_idx == NOVEL_IDX).unsqueeze(-1)  # (batch, 1)
-        wisdom_op = self.wisdom_to_op(wisdom)            # (batch, d_model)
-        op_enc = torch.where(is_novel, wisdom_op, op_emb)
+        # ALWAYS use wisdom_to_op — solver is wisdom-dependent by construction
+        # op_embedding is NOT used here (kept for initialization/anchoring only)
+        op_enc = self.wisdom_to_op(wisdom)  # (batch, d_model)
 
         step_enc = sinusoidal_step_encoding(step_num, d // 4, batch_size, state.device)
         wisdom_enc = F.gelu(self.wisdom_enc_linear(wisdom))
@@ -659,7 +882,12 @@ class ElasticSolver(nn.Module):
 
         return new_state, compute_cost
 
-    def forward(self, programs, initial_states, wisdom, training_noise_std=0.0):
+    def forward(self, programs, initial_states, per_step_wisdom, training_noise_std=0.0):
+        """Forward with per-step wisdom.
+
+        Args:
+            per_step_wisdom: (batch, max_steps, d_wisdom) — each step gets its own wisdom
+        """
         n_steps = programs.shape[1]
         state = initial_states
         all_preds = []
@@ -668,8 +896,9 @@ class ElasticSolver(nn.Module):
 
         for t in range(n_steps):
             op_idx = programs[:, t]
+            wisdom_t = per_step_wisdom[:, t, :]  # (batch, d_wisdom)
             state, compute_cost = self.step(
-                state, op_idx, t, wisdom,
+                state, op_idx, t, wisdom_t,
                 training_noise_std=training_noise_std,
             )
             pred = self.predictor(state)
@@ -742,20 +971,15 @@ class BroadMindV079(nn.Module):
         # Halter (from v0.77, loads pretrained weights)
         self.halter = Halter(config)
 
-    def get_wisdom(self, initial_states, demo_states, demo_next_states,
-                   demo_emb=None, aggregate_only=False):
-        """Get wisdom from MetaWisdomEncoder."""
-        return self.meta_wisdom(initial_states, demo_states, demo_next_states,
-                                demo_emb=demo_emb, aggregate_only=aggregate_only)
+    def forward_all_steps(self, programs, initial_states, per_step_wisdom,
+                          training_noise_std=0.0):
+        """Run all steps with per-step wisdom.
 
-    def forward_all_steps(self, programs, initial_states, demo_states, demo_next_states,
-                          training_noise_std=0.0, demo_emb=None, aggregate_only=False):
-        """Run all steps with meta-wisdom."""
-        wisdom = self.get_wisdom(initial_states, demo_states, demo_next_states,
-                                 demo_emb=demo_emb, aggregate_only=aggregate_only)
-
+        Args:
+            per_step_wisdom: (batch, max_steps, d_wisdom)
+        """
         preds, states, compute_cost = self.solver(
-            programs, initial_states, wisdom,
+            programs, initial_states, per_step_wisdom,
             training_noise_std=training_noise_std,
         )
 
@@ -764,15 +988,13 @@ class BroadMindV079(nn.Module):
             logit = self.halter(programs, t)
             halt_logits.append(logit)
 
-        return preds, torch.stack(halt_logits, dim=1), wisdom, compute_cost
+        return preds, torch.stack(halt_logits, dim=1), compute_cost
 
-    def forward_adaptive(self, programs, initial_states, demo_states, demo_next_states,
+    def forward_adaptive(self, programs, initial_states, per_step_wisdom,
                          training_noise_std=0.0):
-        """Forward with adaptive halting."""
+        """Forward with adaptive halting using per-step wisdom."""
         batch_size = programs.shape[0]
         max_steps = programs.shape[1]
-
-        wisdom = self.get_wisdom(initial_states, demo_states, demo_next_states)
 
         state = initial_states
         halted = torch.zeros(batch_size, dtype=torch.bool, device=state.device)
@@ -785,8 +1007,9 @@ class BroadMindV079(nn.Module):
                 break
 
             op_idx = programs[:, t]
+            wisdom_t = per_step_wisdom[:, t, :]
             new_state, compute_cost = self.solver.step(
-                state, op_idx, t, wisdom,
+                state, op_idx, t, wisdom_t,
                 training_noise_std=training_noise_std,
             )
             total_compute_cost = total_compute_cost + compute_cost
@@ -919,110 +1142,91 @@ def load_v077_checkpoint(model, checkpoint_path):
     return old_wisdom_codes
 
 # ============================================================================
-# SUPPORT SET HELPERS
+# (Old support set helpers removed — replaced by compute_batch_wisdom above)
 # ============================================================================
 
-def generate_family_support_sets(n_support=16):
-    """Generate one support set per training family.
-
-    Returns dict: family_id -> (states, next_states) each (n_support, 3)
-    """
-    support = {}
-    for fam_id, fam_info in TRAIN_FAMILIES.items():
-        fam = {fam_id: fam_info}
-        s, ns = generate_support_transitions(fam, n_support)
-        support[fam_id] = (s, ns)
-    return support
-
-
-def build_per_sample_support(family_ids, family_support):
-    """Build per-sample support tensors from per-family support sets.
-
-    Each sample gets the support set of its family.
-    Returns: (batch, K, 3), (batch, K, 3)
-    """
-    batch_size = family_ids.shape[0]
-    K = list(family_support.values())[0][0].shape[0]
-
-    all_s = []
-    all_ns = []
-    for b in range(batch_size):
-        fid = family_ids[b].item()
-        if fid in family_support:
-            s, ns = family_support[fid]
-        else:
-            # Fallback for novel families — use random training family
-            s, ns = list(family_support.values())[0]
-        all_s.append(s)
-        all_ns.append(ns)
-
-    return torch.stack(all_s), torch.stack(all_ns)
-
 # ============================================================================
-# TRAINING PHASES
+# TRAINING PHASES (v0.79d: wisdom-first, procedural diversity)
 # ============================================================================
+
+def _compute_task_loss(preds, intermediate, lengths):
+    """Compute masked MSE loss over valid program steps."""
+    max_steps = preds.shape[1]
+    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
+    mask = mask.unsqueeze(-1).float()
+    return ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
+
+
+def _compute_anchor_loss(model, batch, old_wisdom_codes, iteration):
+    """Compute wisdom anchoring loss against v0.77 family codes."""
+    if old_wisdom_codes is None:
+        return torch.tensor(0.0, device=config.device)
+
+    anchor_w = config.anchor_weight * (config.anchor_decay ** iteration)
+    family_ids = batch['family_ids']
+    op_names = batch['op_names']
+    max_steps = batch['program_indices'].shape[1]
+
+    # Compute mean wisdom per family and compare to old codes
+    loss = torch.tensor(0.0, device=config.device)
+    with torch.no_grad():
+        per_step_wisdom = compute_batch_wisdom(model, op_names, max_steps, aggregate_only=True)
+
+    for fam_id in range(config.n_train_families):
+        fam_mask = (family_ids == fam_id)
+        if fam_mask.sum() == 0:
+            continue
+        # Mean wisdom across all steps of all samples in this family
+        fam_w = per_step_wisdom[fam_mask].mean(dim=(0, 1))  # (d_wisdom,)
+        target = old_wisdom_codes[fam_id]
+        loss = loss + F.mse_loss(fam_w, target)
+
+    return anchor_w * loss / max(config.n_train_families, 1)
+
 
 def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
-    """Phase 1: MetaWisdomEncoder only, aggregate mode, NO NOVEL masking.
+    """Phase 1: MetaWisdom only, 4 named families, per-op wisdom, anchoring.
 
-    Goal: MetaWisdomEncoder produces wisdom close to v0.77 codes.
-    Per-family shared support sets for consistent wisdom.
+    Solver frozen. MetaWisdom learns to produce wisdom that makes the
+    frozen solver work when using wisdom_to_op (instead of op_embedding).
     """
     model.meta_wisdom.train()
     model.solver.eval()
     model.halter.eval()
-
     optimizer.zero_grad()
 
-    # NO novel masking in Phase 1
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.3,
-        novel_mask_rate=0.0,
-    )
+    batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                           families=TRAIN_FAMILIES, mixed_prob=0.3)
 
     programs = batch['program_indices']
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
-    family_ids = batch['family_ids']
+    max_steps = programs.shape[1]
 
-    # Per-family shared support sets (consistent wisdom per family)
-    family_support = generate_family_support_sets(config.n_support)
-    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+    # Per-op wisdom (the key change from v0.79c)
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
 
-    # Get wisdom — aggregate_only mode (no problem-state dependency)
-    wisdom = model.get_wisdom(
-        initial_states, demo_states, demo_next_states, aggregate_only=True
-    )
+    # Run solver with wisdom (gradients only through MetaWisdom)
+    preds, _, _ = model.solver(programs, initial_states, per_step_wisdom)
+    task_loss = _compute_task_loss(preds, intermediate, lengths)
 
-    # Run solver with gradients through wisdom
-    preds, _, _ = model.solver(programs, initial_states, wisdom)
-
-    batch_size, max_steps, n_vars = preds.shape
-    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1).float()
-
-    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
-
-    # Strong wisdom anchoring loss
+    # Anchoring loss
     anchor_loss = torch.tensor(0.0, device=config.device)
     if old_wisdom_codes is not None:
         anchor_w = config.anchor_weight * (config.anchor_decay ** iteration)
-
+        family_ids = batch['family_ids']
         for fam_id in range(config.n_train_families):
             fam_mask = (family_ids == fam_id)
             if fam_mask.sum() == 0:
                 continue
-            fam_wisdom = wisdom[fam_mask]
-            target = old_wisdom_codes[fam_id].unsqueeze(0).expand_as(fam_wisdom)
-            anchor_loss = anchor_loss + F.mse_loss(fam_wisdom, target)
+            fam_w = per_step_wisdom[fam_mask].mean(dim=(0, 1))
+            target = old_wisdom_codes[fam_id]
+            anchor_loss = anchor_loss + F.mse_loss(fam_w, target)
+        anchor_loss = anchor_w * anchor_loss / max(config.n_train_families, 1)
 
-        anchor_loss = anchor_loss / max(config.n_train_families, 1)
-        loss = task_loss + anchor_w * anchor_loss
-    else:
-        loss = task_loss
-
+    loss = task_loss + anchor_loss
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.meta_wisdom.parameters(), config.grad_clip)
     optimizer.step()
@@ -1030,95 +1234,86 @@ def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
     return task_loss.item(), anchor_loss.item()
 
 
-def train_phase1b_novel_dependency(model, optimizer, iteration, total_iterations):
-    """Phase 1b: Teach solver to depend on wisdom when seeing NOVEL token.
+def train_phase2_joint(model, optimizer, old_wisdom_codes, iteration):
+    """Phase 2: Joint solver + MetaWisdom, 4 named families.
 
-    Solver trainable, MetaWisdom frozen. Gradually ramp NOVEL masking 0% -> 30%.
+    Solver re-learns to use wisdom_to_op features (instead of memorized op_embedding).
+    Weaker anchoring — let wisdom evolve toward what the solver actually needs.
     """
-    model.solver.train()
-    model.meta_wisdom.eval()
-    model.halter.eval()
-
-    optimizer.zero_grad()
-
-    # Ramp NOVEL masking linearly
-    progress = iteration / max(total_iterations - 1, 1)
-    novel_rate = config.novel_mask_rate * progress  # 0 -> 0.3
-
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.5,
-        novel_mask_rate=novel_rate,
-    )
-
-    programs = batch['program_indices']
-    initial_states = batch['initial_states']
-    intermediate = batch['intermediate']
-    lengths = batch['lengths']
-    family_ids = batch['family_ids']
-
-    # Per-family support
-    family_support = generate_family_support_sets(config.n_support)
-    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
-
-    # Frozen MetaWisdom produces wisdom
-    with torch.no_grad():
-        wisdom = model.get_wisdom(
-            initial_states, demo_states, demo_next_states, aggregate_only=True
-        )
-
-    preds, _, compute_cost = model.solver(programs, initial_states, wisdom)
-
-    batch_size, max_steps, n_vars = preds.shape
-    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1).float()
-
-    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
-    cost_loss = config.compute_cost_weight * compute_cost
-    loss = task_loss + cost_loss
-
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.solver.parameters(), config.grad_clip)
-    optimizer.step()
-
-    return task_loss.item(), novel_rate
-
-
-def train_phase2_joint(model, optimizer, iteration, total_iterations):
-    """Phase 2: Joint MetaWisdom (cross-attention) + Solver. NOVEL at 30%."""
     model.meta_wisdom.train()
     model.solver.train()
     model.halter.eval()
-
     optimizer.zero_grad()
 
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.5,
-        novel_mask_rate=config.novel_mask_rate,
-    )
+    batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                           families=TRAIN_FAMILIES, mixed_prob=0.5)
 
     programs = batch['program_indices']
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
-    family_ids = batch['family_ids']
+    max_steps = programs.shape[1]
 
-    # Per-family support
-    family_support = generate_family_support_sets(config.n_support)
-    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
 
-    # Full cross-attention mode (not aggregate)
-    wisdom = model.get_wisdom(
-        initial_states, demo_states, demo_next_states, aggregate_only=False
-    )
-    preds, _, compute_cost = model.solver(programs, initial_states, wisdom)
+    preds, _, compute_cost = model.solver(programs, initial_states, per_step_wisdom)
+    task_loss = _compute_task_loss(preds, intermediate, lengths)
 
-    batch_size, max_steps, n_vars = preds.shape
-    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1).float()
+    # Weaker anchoring (half weight)
+    anchor_loss = torch.tensor(0.0, device=config.device)
+    if old_wisdom_codes is not None:
+        anchor_w = 0.5 * config.anchor_weight * (config.anchor_decay ** iteration)
+        family_ids = batch['family_ids']
+        for fam_id in range(config.n_train_families):
+            fam_mask = (family_ids == fam_id)
+            if fam_mask.sum() == 0:
+                continue
+            fam_w = per_step_wisdom[fam_mask].mean(dim=(0, 1))
+            target = old_wisdom_codes[fam_id]
+            anchor_loss = anchor_loss + F.mse_loss(fam_w, target)
+        anchor_loss = anchor_w * anchor_loss / max(config.n_train_families, 1)
 
-    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
+    cost_loss = config.compute_cost_weight * compute_cost
+    loss = task_loss + anchor_loss + cost_loss
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+    optimizer.step()
+
+    return task_loss.item(), anchor_loss.item()
+
+
+def train_phase3_diversity(model, optimizer):
+    """Phase 3: 50% named + 50% procedural ops. The diversity phase.
+
+    This is where meta-learning generalization emerges. Procedural ops
+    force MetaWisdomEncoder to extract general transformation semantics.
+    No anchoring — wisdom finds its own space.
+    """
+    model.meta_wisdom.train()
+    model.solver.train()
+    model.halter.eval()
+    optimizer.zero_grad()
+
+    use_procedural = random.random() < config.procedural_prob
+
+    if use_procedural:
+        batch = generate_procedural_batch(config.batch_size, min_len=1, max_len=4)
+    else:
+        batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                               families=TRAIN_FAMILIES, mixed_prob=0.5)
+
+    programs = batch['program_indices']
+    initial_states = batch['initial_states']
+    intermediate = batch['intermediate']
+    lengths = batch['lengths']
+    max_steps = programs.shape[1]
+
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
+
+    preds, _, compute_cost = model.solver(programs, initial_states, per_step_wisdom)
+    task_loss = _compute_task_loss(preds, intermediate, lengths)
     cost_loss = config.compute_cost_weight * compute_cost
     loss = task_loss + cost_loss
 
@@ -1126,21 +1321,18 @@ def train_phase2_joint(model, optimizer, iteration, total_iterations):
     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
     optimizer.step()
 
-    return task_loss.item(), cost_loss.item()
+    return task_loss.item(), use_procedural
 
 
-def train_phase3_halter(model, optimizer):
-    """Phase 3: Train halter only."""
+def train_phase4_halter(model, optimizer):
+    """Phase 4: Halter only."""
     model.halter.train()
     model.solver.eval()
     model.meta_wisdom.eval()
-
     optimizer.zero_grad()
 
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.5,
-    )
+    batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                           families=TRAIN_FAMILIES, mixed_prob=0.5)
 
     programs = batch['program_indices']
     lengths = batch['lengths']
@@ -1157,39 +1349,34 @@ def train_phase3_halter(model, optimizer):
     total_loss.backward()
     torch.nn.utils.clip_grad_norm_(model.halter.parameters(), config.grad_clip)
     optimizer.step()
-
     return total_loss.item()
 
 
-def train_phase4_e2e(model, optimizer):
-    """Phase 4: End-to-end fine-tuning. NOVEL masking at 30%."""
+def train_phase5_e2e(model, optimizer):
+    """Phase 5: End-to-end with named + procedural ops."""
     model.train()
     optimizer.zero_grad()
 
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.5,
-        novel_mask_rate=config.novel_mask_rate,
-    )
+    use_procedural = random.random() < config.procedural_prob
+    if use_procedural:
+        batch = generate_procedural_batch(config.batch_size, min_len=1, max_len=4)
+    else:
+        batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                               families=TRAIN_FAMILIES, mixed_prob=0.5)
 
     programs = batch['program_indices']
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
-    family_ids = batch['family_ids']
+    max_steps = programs.shape[1]
 
-    family_support = generate_family_support_sets(config.n_support)
-    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
 
-    preds, halt_logits, wisdom, compute_cost = model.forward_all_steps(
-        programs, initial_states, demo_states, demo_next_states,
-    )
+    preds, halt_logits, compute_cost = model.forward_all_steps(
+        programs, initial_states, per_step_wisdom)
 
-    batch_size, max_steps, n_vars = preds.shape
-    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1).float()
-
-    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
+    task_loss = _compute_task_loss(preds, intermediate, lengths)
 
     halt_loss = 0.0
     for t in range(max_steps):
@@ -1199,64 +1386,49 @@ def train_phase4_e2e(model, optimizer):
     halt_loss = halt_loss / max_steps
 
     loss = task_loss + 0.5 * halt_loss + config.compute_cost_weight * compute_cost
-
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
     optimizer.step()
-
     return task_loss.item(), halt_loss.item()
 
 
-def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
-    """Phase 5: Length generalization with noise. NOVEL masking at 30%."""
+def train_phase6_lengthgen(model, optimizer, iteration, total_iterations):
+    """Phase 6: Length generalization with noise."""
     model.solver.train()
     model.meta_wisdom.train()
     model.halter.eval()
-
     optimizer.zero_grad()
 
     progress = iteration / max(total_iterations - 1, 1)
     noise_std = config.noise_std * (1.0 - progress) + 0.02 * progress
 
-    batch = generate_batch(
-        config.batch_size, min_len=1, max_len=4,
-        families=TRAIN_FAMILIES, mixed_prob=0.5,
-        novel_mask_rate=config.novel_mask_rate,
-    )
+    batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                           families=TRAIN_FAMILIES, mixed_prob=0.5)
 
     programs = batch['program_indices']
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
-    family_ids = batch['family_ids']
+    max_steps = programs.shape[1]
 
-    family_support = generate_family_support_sets(config.n_support)
-    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
-
-    wisdom = model.get_wisdom(initial_states, demo_states, demo_next_states)
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
 
     preds_noisy, _, compute_cost = model.solver(
-        programs, initial_states, wisdom,
-        training_noise_std=noise_std,
-    )
+        programs, initial_states, per_step_wisdom, training_noise_std=noise_std)
 
-    batch_size, max_steps, n_vars = preds_noisy.shape
-    mask = torch.arange(max_steps, device=preds_noisy.device).unsqueeze(0) < lengths.unsqueeze(1)
-    mask = mask.unsqueeze(-1).float()
-
-    task_loss = ((preds_noisy - intermediate) ** 2 * mask).sum() / mask.sum()
+    task_loss = _compute_task_loss(preds_noisy, intermediate, lengths)
 
     with torch.no_grad():
         preds_clean, _, _ = model.solver(
-            programs, initial_states, wisdom.detach(),
-            training_noise_std=0.0,
-        )
+            programs, initial_states, per_step_wisdom.detach(), training_noise_std=0.0)
 
+    mask = torch.arange(max_steps, device=preds_noisy.device).unsqueeze(0) < lengths.unsqueeze(1)
+    mask = mask.unsqueeze(-1).float()
     consistency_loss = ((preds_noisy - preds_clean.detach()) ** 2 * mask).sum() / mask.sum()
 
     cost_loss = config.compute_cost_weight * compute_cost
     loss = task_loss + 0.1 * consistency_loss + cost_loss
-
     loss.backward()
     params = list(model.solver.parameters()) + list(model.meta_wisdom.parameters())
     torch.nn.utils.clip_grad_norm_(params, config.grad_clip)
@@ -1265,166 +1437,125 @@ def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
     return task_loss.item(), consistency_loss.item(), noise_std
 
 # ============================================================================
-# EVALUATION
+# EVALUATION (v0.79d: per-step wisdom)
 # ============================================================================
+
+def _eval_with_adaptive(model, batch, n_support=16):
+    """Run adaptive inference with per-step wisdom for a batch.
+
+    Returns: predictions (batch, 3), steps_used (batch,)
+    """
+    max_steps = batch['program_indices'].shape[1]
+    per_step_wisdom = compute_batch_wisdom(
+        model, batch['op_names'], max_steps, aggregate_only=True)
+    predictions, steps_used, _ = model.forward_adaptive(
+        batch['program_indices'], batch['initial_states'], per_step_wisdom)
+    return predictions, steps_used
+
 
 def evaluate_training_families(model, n_batches=10, max_len=4):
     """Evaluate on training families (L1-4 or longer)."""
     model.eval()
-
     results = {
         'exact': 0, 'total': 0,
         'by_length': defaultdict(lambda: {'correct': 0, 'total': 0}),
         'by_family': defaultdict(lambda: {'correct': 0, 'total': 0}),
     }
-
     with torch.no_grad():
-        # Shared support set for training families
-        demo_s, demo_ns = generate_support_transitions(TRAIN_FAMILIES, config.n_support)
-
         for _ in range(n_batches):
-            batch = generate_batch(
-                config.batch_size, min_len=1, max_len=max_len,
-                families=TRAIN_FAMILIES, mixed_prob=0.5,
-            )
-
+            batch = generate_batch(config.batch_size, min_len=1, max_len=max_len,
+                                   families=TRAIN_FAMILIES, mixed_prob=0.5)
             final_targets = torch.stack([
                 batch['intermediate'][b, batch['lengths'][b] - 1]
-                for b in range(config.batch_size)
-            ])
-
-            predictions, steps_used, _ = model.forward_adaptive(
-                batch['program_indices'],
-                batch['initial_states'],
-                demo_s, demo_ns,
-            )
-
+                for b in range(config.batch_size)])
+            predictions, _ = _eval_with_adaptive(model, batch)
             pred_rounded = predictions.round()
             exact = (pred_rounded == final_targets).all(dim=-1)
-
             results['exact'] += exact.sum().item()
             results['total'] += config.batch_size
-
             for b in range(config.batch_size):
                 length = batch['lengths'][b].item()
                 family_id = batch['family_ids'][b].item()
                 family_name = TRAIN_FAMILIES[family_id]['name']
-
                 results['by_length'][length]['total'] += 1
                 results['by_family'][family_name]['total'] += 1
                 if exact[b]:
                     results['by_length'][length]['correct'] += 1
                     results['by_family'][family_name]['correct'] += 1
-
     results['accuracy'] = results['exact'] / max(results['total'], 1) * 100
-
     for length in results['by_length']:
         r = results['by_length'][length]
         r['accuracy'] = r['correct'] / r['total'] * 100 if r['total'] > 0 else 0
-
     for family in results['by_family']:
         r = results['by_family'][family]
         r['accuracy'] = r['correct'] / r['total'] * 100 if r['total'] > 0 else 0
-
     return results
 
 
 def evaluate_novel_families(model, n_batches=10, max_len=4, n_support=16):
-    """Evaluate on novel families using K support transitions."""
+    """Evaluate on novel families using K support transitions per op."""
     model.eval()
-
     results = {
         'exact': 0, 'total': 0,
         'by_family': defaultdict(lambda: {'correct': 0, 'total': 0}),
         'by_difficulty': defaultdict(lambda: {'correct': 0, 'total': 0}),
     }
-
     with torch.no_grad():
         for fam_id, fam_info in NOVEL_FAMILIES.items():
             fam_families = {fam_id: fam_info}
             difficulty = fam_info['difficulty']
-
-            # Generate support transitions for this novel family
-            demo_s, demo_ns = generate_support_transitions(fam_families, n_support)
-
             for _ in range(n_batches):
-                batch = generate_batch(
-                    config.batch_size, min_len=1, max_len=max_len,
-                    families=fam_families,
-                )
-
+                batch = generate_batch(config.batch_size, min_len=1,
+                                       max_len=max_len, families=fam_families)
                 final_targets = torch.stack([
                     batch['intermediate'][b, batch['lengths'][b] - 1]
-                    for b in range(config.batch_size)
-                ])
-
-                predictions, steps_used, _ = model.forward_adaptive(
-                    batch['program_indices'],
-                    batch['initial_states'],
-                    demo_s, demo_ns,
-                )
-
+                    for b in range(config.batch_size)])
+                predictions, _ = _eval_with_adaptive(model, batch)
                 pred_rounded = predictions.round()
                 exact = (pred_rounded == final_targets).all(dim=-1)
-
                 results['exact'] += exact.sum().item()
                 results['total'] += config.batch_size
                 results['by_family'][fam_info['name']]['total'] += config.batch_size
                 results['by_family'][fam_info['name']]['correct'] += exact.sum().item()
                 results['by_difficulty'][difficulty]['total'] += config.batch_size
                 results['by_difficulty'][difficulty]['correct'] += exact.sum().item()
-
     results['accuracy'] = results['exact'] / max(results['total'], 1) * 100
-
     for family in results['by_family']:
         r = results['by_family'][family]
         r['accuracy'] = r['correct'] / r['total'] * 100 if r['total'] > 0 else 0
-
     for diff in results['by_difficulty']:
         r = results['by_difficulty'][diff]
         r['accuracy'] = r['correct'] / r['total'] * 100 if r['total'] > 0 else 0
-
     return results
 
 
 def evaluate_kshot_curve(model, k_values=[4, 8, 16, 32], n_batches=5):
-    """Test novel families at different K values."""
-    model.eval()
-    results = {}
+    """Test novel families at different K values.
 
+    For each K, generates K demo transitions per op for wisdom computation.
+    """
+    model.eval()
+    old_n_support = config.n_support
+    results = {}
     with torch.no_grad():
         for k in k_values:
-            correct = 0
-            total = 0
-
+            config.n_support = k  # temporarily change K
+            correct, total = 0, 0
             for fam_id, fam_info in NOVEL_FAMILIES.items():
                 fam_families = {fam_id: fam_info}
-                demo_s, demo_ns = generate_support_transitions(fam_families, k)
-
                 for _ in range(n_batches):
-                    batch = generate_batch(
-                        config.batch_size, min_len=1, max_len=4,
-                        families=fam_families,
-                    )
-
+                    batch = generate_batch(config.batch_size, min_len=1,
+                                           max_len=4, families=fam_families)
                     final_targets = torch.stack([
                         batch['intermediate'][b, batch['lengths'][b] - 1]
-                        for b in range(config.batch_size)
-                    ])
-
-                    predictions, _, _ = model.forward_adaptive(
-                        batch['program_indices'],
-                        batch['initial_states'],
-                        demo_s, demo_ns,
-                    )
-
+                        for b in range(config.batch_size)])
+                    predictions, _ = _eval_with_adaptive(model, batch)
                     pred_rounded = predictions.round()
                     exact = (pred_rounded == final_targets).all(dim=-1)
                     correct += exact.sum().item()
                     total += config.batch_size
-
             results[k] = correct / max(total, 1) * 100
-
+    config.n_support = old_n_support
     return results
 
 
@@ -1432,66 +1563,42 @@ def evaluate_length_gen_novel(model, lengths=[4, 8, 12, 16], n_batches=5):
     """Test novel families at different program lengths."""
     model.eval()
     results = {}
-
     with torch.no_grad():
         for L in lengths:
-            correct = 0
-            total = 0
-
+            correct, total = 0, 0
             for fam_id, fam_info in NOVEL_FAMILIES.items():
                 fam_families = {fam_id: fam_info}
-                demo_s, demo_ns = generate_support_transitions(fam_families, config.n_support)
-
                 for _ in range(n_batches):
-                    batch = generate_batch(
-                        config.batch_size, min_len=L, max_len=L,
-                        families=fam_families,
-                    )
-
+                    batch = generate_batch(config.batch_size, min_len=L,
+                                           max_len=L, families=fam_families)
                     final_targets = torch.stack([
                         batch['intermediate'][b, batch['lengths'][b] - 1]
-                        for b in range(config.batch_size)
-                    ])
-
-                    predictions, _, _ = model.forward_adaptive(
-                        batch['program_indices'],
-                        batch['initial_states'],
-                        demo_s, demo_ns,
-                    )
-
+                        for b in range(config.batch_size)])
+                    predictions, _ = _eval_with_adaptive(model, batch)
                     pred_rounded = predictions.round()
                     exact = (pred_rounded == final_targets).all(dim=-1)
                     correct += exact.sum().item()
                     total += config.batch_size
-
             results[L] = correct / max(total, 1) * 100
-
     return results
 
 # ============================================================================
-# SOLVER-ONLY EVALUATION (for Phase 1 monitoring)
+# SOLVER-ONLY EVALUATION (for phase monitoring)
 # ============================================================================
 
 def evaluate_solver_only(model, n_batches=10):
-    """Quick eval: solver accuracy with meta-wisdom (no halter)."""
+    """Quick eval: solver accuracy with per-step wisdom (no halter)."""
     model.eval()
-    correct = 0
-    total = 0
-
+    correct, total = 0, 0
     with torch.no_grad():
-        demo_s, demo_ns = generate_support_transitions(TRAIN_FAMILIES, config.n_support)
-
         for _ in range(n_batches):
-            batch = generate_batch(
-                config.batch_size, min_len=1, max_len=4,
-                families=TRAIN_FAMILIES,
-            )
-
-            wisdom = model.get_wisdom(batch['initial_states'], demo_s, demo_ns)
+            batch = generate_batch(config.batch_size, min_len=1, max_len=4,
+                                   families=TRAIN_FAMILIES)
+            max_steps = batch['program_indices'].shape[1]
+            per_step_wisdom = compute_batch_wisdom(
+                model, batch['op_names'], max_steps, aggregate_only=True)
             preds, _, _ = model.solver(
-                batch['program_indices'], batch['initial_states'], wisdom
-            )
-
+                batch['program_indices'], batch['initial_states'], per_step_wisdom)
             for b in range(config.batch_size):
                 length = batch['lengths'][b].item()
                 pred = preds[b, length - 1].round()
@@ -1499,15 +1606,14 @@ def evaluate_solver_only(model, n_batches=10):
                 if (pred == target).all():
                     correct += 1
                 total += 1
-
     return correct / max(total, 1) * 100
 
 # ============================================================================
-# MAIN TRAINING LOOP
+# MAIN TRAINING LOOP (v0.79d: 6 phases)
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='BroadMind v0.79 Meta-Learning')
+    parser = argparse.ArgumentParser(description='BroadMind v0.79d Meta-Learning')
     parser.add_argument('--checkpoint', type=str,
                         default='broadmind_v077_elastic.pt',
                         help='Path to v0.77 checkpoint')
@@ -1519,27 +1625,23 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("BroadMind v0.79: Meta-Learning Wisdom (FluxMind Integration)")
+    print("BroadMind v0.79d: Meta-Learning Wisdom (Always-Wisdom + Procedural)")
     print("=" * 70)
     print(f"Device: {config.device}")
     print()
 
-    # Build model
     model = BroadMindV079(config).to(config.device)
 
-    # Count parameters
     meta_params = model.meta_wisdom.count_parameters()
     solver_params = sum(p.numel() for p in model.solver.parameters() if p.requires_grad)
     halter_params = sum(p.numel() for p in model.halter.parameters() if p.requires_grad)
     total_params = model.count_parameters()
-
     print(f"MetaWisdomEncoder: {meta_params:,} params")
     print(f"ElasticSolver:     {solver_params:,} params")
     print(f"Halter:            {halter_params:,} params")
     print(f"Total:             {total_params:,} params")
     print()
 
-    # Load v0.77 checkpoint
     checkpoint_dir = os.path.dirname(os.path.abspath(__file__))
     checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint)
     print(f"[LOADING] v0.77 checkpoint from: {checkpoint_path}")
@@ -1553,148 +1655,105 @@ def main():
         run_full_evaluation(model)
         return
 
-    # ========================================================================
-    # TRAINING
-    # ========================================================================
-
     start_time = time.time()
 
-    # ---- Phase 1: MetaWisdomEncoder only (aggregate, no NOVEL) ----
+    # ---- Phase 1: MetaWisdom only, 4 named families ----
     print("=" * 70)
-    print(f"Phase 1: MetaWisdomEncoder training ({config.n_iterations_phase1} iters)")
-    print("  Aggregate mode, NO NOVEL masking, strong anchoring")
+    print(f"Phase 1: MetaWisdomEncoder ({config.n_iterations_phase1} iters)")
+    print("  Per-op wisdom, solver frozen, strong anchoring")
+    print("  Solver uses wisdom_to_op ALWAYS (no op_embedding)")
     print("=" * 70)
-
-    optimizer = torch.optim.AdamW(
-        model.meta_wisdom.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-    )
-
+    optimizer = torch.optim.AdamW(model.meta_wisdom.parameters(),
+                                  lr=config.lr, weight_decay=config.weight_decay)
     for i in range(config.n_iterations_phase1):
-        task_loss, anchor_loss = train_phase1_meta_wisdom(
-            model, optimizer, old_wisdom_codes, i
-        )
-
+        task_loss, anchor_loss = train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, i)
         if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
-            anchor_w = config.anchor_weight * (config.anchor_decay ** i)
             print(f"  P1 [{i+1:4d}/{config.n_iterations_phase1}] "
-                  f"task={task_loss:.4f} anchor={anchor_loss:.4f} "
-                  f"(w={anchor_w:.3f}) acc={acc:.1f}%")
-
+                  f"task={task_loss:.4f} anchor={anchor_loss:.4f} acc={acc:.1f}%")
     p1_acc = evaluate_solver_only(model, n_batches=10)
     print(f"\n  Phase 1 done: acc = {p1_acc:.1f}%")
 
-    # ---- Phase 1b: Teach solver NOVEL dependency ----
+    # ---- Phase 2: Joint solver + MetaWisdom, 4 named families ----
     print()
     print("=" * 70)
-    print(f"Phase 1b: NOVEL dependency ({config.n_iterations_phase1b} iters)")
-    print("  Solver trains, MetaWisdom frozen, NOVEL ramps 0% -> 30%")
+    print(f"Phase 2: Joint solver+MetaWisdom ({config.n_iterations_phase2} iters)")
+    print("  Solver re-learns with wisdom_to_op features, weaker anchoring")
     print("=" * 70)
-
-    optimizer = torch.optim.AdamW(
-        model.solver.parameters(),
-        lr=config.lr_joint,
-        weight_decay=config.weight_decay,
-    )
-
-    for i in range(config.n_iterations_phase1b):
-        task_loss, novel_rate = train_phase1b_novel_dependency(
-            model, optimizer, i, config.n_iterations_phase1b
-        )
-
-        if (i + 1) % 300 == 0:
-            acc = evaluate_solver_only(model, n_batches=5)
-            print(f"  P1b [{i+1:4d}/{config.n_iterations_phase1b}] "
-                  f"task={task_loss:.4f} novel_rate={novel_rate:.2f} acc={acc:.1f}%")
-
-    p1b_acc = evaluate_solver_only(model, n_batches=10)
-    print(f"\n  Phase 1b done: acc = {p1b_acc:.1f}%")
-
-    # ---- Phase 2: Joint with cross-attention ----
-    print()
-    print("=" * 70)
-    print(f"Phase 2: Joint fine-tuning ({config.n_iterations_phase2} iters)")
-    print("  Cross-attention mode, NOVEL at 30%, LR=5e-4")
-    print("=" * 70)
-
     optimizer = torch.optim.AdamW(
         list(model.meta_wisdom.parameters()) + list(model.solver.parameters()),
-        lr=config.lr_joint,
-        weight_decay=config.weight_decay,
-    )
-
+        lr=config.lr_joint, weight_decay=config.weight_decay)
     for i in range(config.n_iterations_phase2):
-        task_loss, cost_loss = train_phase2_joint(model, optimizer, i, config.n_iterations_phase2)
-
+        task_loss, anchor_loss = train_phase2_joint(model, optimizer, old_wisdom_codes, i)
         if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
             print(f"  P2 [{i+1:4d}/{config.n_iterations_phase2}] "
-                  f"task={task_loss:.4f} cost={cost_loss:.4f} acc={acc:.1f}%")
-
+                  f"task={task_loss:.4f} anchor={anchor_loss:.4f} acc={acc:.1f}%")
     p2_acc = evaluate_solver_only(model, n_batches=10)
     print(f"\n  Phase 2 done: acc = {p2_acc:.1f}%")
 
-    # ---- Phase 3: Halter only ----
+    # ---- Phase 3: Diversity (50% named + 50% procedural) ----
     print()
     print("=" * 70)
-    print(f"Phase 3: Halter training ({config.n_iterations_phase3} iters)")
+    print(f"Phase 3: Diversity ({config.n_iterations_phase3} iters)")
+    print("  50% named + 50% procedural ops -- meta-learning emerges here")
     print("=" * 70)
-
     optimizer = torch.optim.AdamW(
-        model.halter.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-    )
-
+        list(model.meta_wisdom.parameters()) + list(model.solver.parameters()),
+        lr=config.lr_joint, weight_decay=config.weight_decay)
+    proc_count = 0
     for i in range(config.n_iterations_phase3):
-        halt_loss = train_phase3_halter(model, optimizer)
-
-        if (i + 1) % 200 == 0:
-            print(f"  P3 [{i+1:4d}/{config.n_iterations_phase3}] halt_loss={halt_loss:.4f}")
-
-    # ---- Phase 4: End-to-end ----
-    print()
-    print("=" * 70)
-    print(f"Phase 4: End-to-end ({config.n_iterations_phase4} iters)")
-    print("  LR=1e-4, all components, NOVEL at 30%")
-    print("=" * 70)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr_fine,
-        weight_decay=config.weight_decay,
-    )
-
-    for i in range(config.n_iterations_phase4):
-        task_loss, halt_loss = train_phase4_e2e(model, optimizer)
-
+        task_loss, used_proc = train_phase3_diversity(model, optimizer)
+        if used_proc:
+            proc_count += 1
         if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
-            print(f"  P4 [{i+1:4d}/{config.n_iterations_phase4}] "
-                  f"task={task_loss:.4f} halt={halt_loss:.4f} acc={acc:.1f}%")
+            print(f"  P3 [{i+1:4d}/{config.n_iterations_phase3}] "
+                  f"task={task_loss:.4f} proc={proc_count}/{i+1} acc={acc:.1f}%")
+    p3_acc = evaluate_solver_only(model, n_batches=10)
+    print(f"\n  Phase 3 done: acc = {p3_acc:.1f}% (procedural batches: {proc_count})")
 
-    # ---- Phase 5: Length generalization ----
+    # ---- Phase 4: Halter ----
     print()
     print("=" * 70)
-    print(f"Phase 5: Length generalization ({config.n_iterations_phase5} iters)")
+    print(f"Phase 4: Halter ({config.n_iterations_phase4} iters)")
+    print("=" * 70)
+    optimizer = torch.optim.AdamW(model.halter.parameters(),
+                                  lr=config.lr, weight_decay=config.weight_decay)
+    for i in range(config.n_iterations_phase4):
+        halt_loss = train_phase4_halter(model, optimizer)
+        if (i + 1) % 200 == 0:
+            print(f"  P4 [{i+1:4d}/{config.n_iterations_phase4}] halt_loss={halt_loss:.4f}")
+
+    # ---- Phase 5: End-to-end ----
+    print()
+    print("=" * 70)
+    print(f"Phase 5: End-to-end ({config.n_iterations_phase5} iters)")
+    print("  All components, named + procedural ops")
+    print("=" * 70)
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                  lr=config.lr_fine, weight_decay=config.weight_decay)
+    for i in range(config.n_iterations_phase5):
+        task_loss, halt_loss = train_phase5_e2e(model, optimizer)
+        if (i + 1) % 300 == 0:
+            acc = evaluate_solver_only(model, n_batches=5)
+            print(f"  P5 [{i+1:4d}/{config.n_iterations_phase5}] "
+                  f"task={task_loss:.4f} halt={halt_loss:.4f} acc={acc:.1f}%")
+
+    # ---- Phase 6: Length generalization ----
+    print()
+    print("=" * 70)
+    print(f"Phase 6: Length generalization ({config.n_iterations_phase6} iters)")
     print("  Solver + MetaWisdom, noise injection")
     print("=" * 70)
-
     optimizer = torch.optim.AdamW(
         list(model.solver.parameters()) + list(model.meta_wisdom.parameters()),
-        lr=config.lr_fine,
-        weight_decay=config.weight_decay,
-    )
-
-    for i in range(config.n_iterations_phase5):
-        task_loss, cons_loss, noise = train_phase5_lengthgen(
-            model, optimizer, i, config.n_iterations_phase5
-        )
-
+        lr=config.lr_fine, weight_decay=config.weight_decay)
+    for i in range(config.n_iterations_phase6):
+        task_loss, cons_loss, noise = train_phase6_lengthgen(
+            model, optimizer, i, config.n_iterations_phase6)
         if (i + 1) % 200 == 0:
-            print(f"  P5 [{i+1:4d}/{config.n_iterations_phase5}] "
+            print(f"  P6 [{i+1:4d}/{config.n_iterations_phase6}] "
                   f"task={task_loss:.4f} cons={cons_loss:.4f} noise={noise:.3f}")
 
     elapsed = time.time() - start_time
@@ -1702,7 +1761,6 @@ def main():
     print(f"Training complete in {elapsed/60:.1f} min")
     print(f"{'=' * 70}")
 
-    # Save checkpoint
     save_path = os.path.join(checkpoint_dir, args.save_path)
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -1711,9 +1769,6 @@ def main():
     }, save_path)
     print(f"Checkpoint saved to: {save_path}")
 
-    # ========================================================================
-    # FULL EVALUATION
-    # ========================================================================
     run_full_evaluation(model)
 
 
