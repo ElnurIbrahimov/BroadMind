@@ -137,11 +137,19 @@ Adaptive range: 120K - 470K per input
 
 ---
 
-### Track 4: Edge Deployment (v0.78)
+### Track 4: Edge Deployment (v0.78) -- DONE
 
 > *"AI that doesn't need a data center to be brilliant."*
 
 **Goal:** Run BroadMind on a Raspberry Pi, a phone, and a microcontroller.
+
+**What was built:** A deployment pipeline that exports the trained v0.77 model to ONNX format with INT8 quantization. Static inference wrappers (`WisdomInference`, `BroadMindInference`) freeze all dynamic control flow (adaptive halting, SwitchableLayerNorm dispatch, width slicing) into ONNX-compatible static graphs. One model per elastic config (minimal/small/medium/full), plus a shared wisdom model.
+
+**Results achieved:**
+- ONNX export with opset 17, constant folding, dynamic batch axis
+- INT8 quantization (PyTorch dynamic + ONNX Runtime static with calibration)
+- INT8 accuracy within 1% of FP32 for all configs
+- Full benchmark suite with accuracy, latency, and model size
 
 #### Model size projections
 
@@ -218,8 +226,44 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | Length generalization (long programs) | Done | v0.75 |
 | Mixture of Recursions (adaptive inner depth) | Done | v0.76 |
 | Hardware-adaptive compute (elastic inference) | Done | v0.77 |
-| Physical integration (edge devices) | Planned | v0.78 |
-| "Evolves learning strategies" | Future | TBD |
+| Physical integration (edge devices) | Done | v0.78 |
+| "Evolves learning strategies" | **In Progress** | v0.79 |
+
+---
+
+### Track 5: Meta-Learning Wisdom (v0.79) -- IN PROGRESS
+
+> *"Evolves its own learning strategies."*
+
+**Goal:** Replace static wisdom (5 fixed 48D codes) with dynamic wisdom generated from demonstration examples. The model learns novel operations it was never trained on by observing a few (state, next_state) transitions.
+
+**Architecture:**
+- MetaWisdomEncoder (~95K params) replaces WisdomBank + WisdomDistiller + WisdomMatcher (~126K)
+- Cross-attention meta-learning: query=problem_context, keys/values=demo embeddings
+- Op-agnostic: sees only (state, next_state) pairs, not operation identity
+- NOVEL token: solver trained to rely on wisdom when op identity is masked (30% masking rate)
+- Wisdom anchoring bootstraps from v0.77 wisdom codes
+
+**Novel operation families (held out):**
+
+| Family | Difficulty | Description |
+|--------|-----------|-------------|
+| SWAP | Easy | Swap variable positions |
+| MIRROR | Easy | Reflect values (10-x) |
+| DOUBLE | Medium | Double with saturation |
+| MIN_MAX | Medium | Min/max operations |
+| MODULAR | Hard | Modular arithmetic |
+| COND_TRANSFER | Hard | Conditional state transfer |
+
+**Training:** 5-phase, ~8300 iterations. Loads v0.77 solver checkpoint, trains MetaWisdomEncoder on top.
+
+**Success criteria:**
+- Training families (L1-4): 98%+
+- Novel easy (SWAP, MIRROR): 90%+
+- Novel medium (DOUBLE, MIN_MAX): 75%+
+- Novel hard (MODULAR, COND_TRANSFER): 60%+
+- Overall novel: 75%+
+- Total params: <500K (~416K)
 
 ---
 
@@ -234,4 +278,5 @@ ONNX Export (torch.onnx.export with dynamo=True)
 | v0.75 | Task scaling (length generalization) | ~421K | 99%+ ID, 80%+ at 16 steps |
 | v0.76 | Mixture of Recursions (adaptive inner depth) | ~445K | 99%+ with depth hierarchy |
 | v0.77 | Elastic inference (width/depth auto-config) | ~447K | 100% full, 98.5% at 50% width |
-| v0.78 | Edge deployment | ~447K (INT8: ~447KB) | TBD |
+| v0.78 | Edge deployment (ONNX + INT8) | ~447K (INT8: ~477KB) | INT8 within 1% of FP32 |
+| v0.79 | Meta-learning wisdom (FluxMind integration) | ~416K | TBD — in progress |
