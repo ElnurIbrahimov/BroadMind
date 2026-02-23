@@ -60,11 +60,12 @@ class Config:
     halt_threshold = 0.5
 
     # Training iterations per phase
-    n_iterations_phase1 = 2000   # MetaWisdomEncoder only (solver frozen)
-    n_iterations_phase2 = 1500   # Joint: MetaWisdom + Solver
+    n_iterations_phase1 = 3000   # MetaWisdomEncoder only, aggregate mode, no NOVEL
+    n_iterations_phase1b = 1500  # Solver learns NOVEL dependency (MetaWisdom frozen)
+    n_iterations_phase2 = 2000   # Joint: MetaWisdom (cross-attn) + Solver, NOVEL ramp
     n_iterations_phase3 = 800    # Halter only
-    n_iterations_phase4 = 1500   # End-to-end
-    n_iterations_phase5 = 500    # Length generalization + noise
+    n_iterations_phase4 = 2000   # End-to-end
+    n_iterations_phase5 = 1000   # Length generalization + noise
 
     # Training hyperparams
     batch_size = 256
@@ -82,8 +83,8 @@ class Config:
     compute_cost_weight = 0.005
 
     # Wisdom anchoring (Phase 1)
-    anchor_weight = 1.0    # weight for wisdom anchoring loss
-    anchor_decay = 0.995   # decay per iteration
+    anchor_weight = 2.0    # stronger anchoring
+    anchor_decay = 0.999   # slower decay — keep anchoring longer
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -462,14 +463,17 @@ class MetaWisdomEncoder(nn.Module):
             demo_emb = demo_emb.squeeze(0)
         return demo_emb
 
-    def forward(self, problem_states, demo_states, demo_next_states, demo_emb=None):
+    def forward(self, problem_states, demo_states, demo_next_states,
+                demo_emb=None, aggregate_only=False):
         """Generate wisdom from demonstrations for given problem states.
 
         Args:
-            problem_states: (batch, 3) — current states needing wisdom
-            demo_states:    (batch, K, 3) or (K, 3) — support before-states
-            demo_next_states: (batch, K, 3) or (K, 3) — support after-states
-            demo_emb:       (batch, K, d_demo) — pre-encoded demos (optional, for efficiency)
+            problem_states:   (batch, 3)
+            demo_states:      (batch, K, 3) or (K, 3)
+            demo_next_states: (batch, K, 3) or (K, 3)
+            demo_emb:         (batch, K, d_demo) pre-encoded (optional)
+            aggregate_only:   if True, mean-pool demos (no cross-attention on
+                              problem state). Gives consistent per-family wisdom.
 
         Returns:
             wisdom: (batch, d_wisdom) — 48D wisdom vector
@@ -478,7 +482,6 @@ class MetaWisdomEncoder(nn.Module):
 
         # Encode demos if not pre-encoded
         if demo_emb is None:
-            # Handle shared demos (same K demos for entire batch)
             if demo_states.dim() == 2:
                 demo_emb = self.encode_demos(demo_states, demo_next_states)
                 demo_emb = demo_emb.unsqueeze(0).expand(batch_size, -1, -1)
@@ -487,16 +490,18 @@ class MetaWisdomEncoder(nn.Module):
         elif demo_emb.dim() == 2:
             demo_emb = demo_emb.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Problem context as query
-        context = self.context_encoder(problem_states)  # (batch, d_demo)
-        query = context.unsqueeze(1)                     # (batch, 1, d_demo)
+        if aggregate_only:
+            # Mean-pool demos — no state dependency, consistent per-family wisdom
+            pooled = demo_emb.mean(dim=1)                # (batch, d_demo)
+            wisdom = self.wisdom_head(pooled)             # (batch, d_wisdom)
+        else:
+            # Cross-attention with problem state as query
+            context = self.context_encoder(problem_states)
+            query = context.unsqueeze(1)
+            attended, _ = self.cross_attention(query, demo_emb, demo_emb)
+            attended = attended.squeeze(1)
+            wisdom = self.wisdom_head(attended)
 
-        # Cross-attention
-        attended, _ = self.cross_attention(query, demo_emb, demo_emb)
-        attended = attended.squeeze(1)                   # (batch, d_demo)
-
-        # Project to wisdom
-        wisdom = self.wisdom_head(attended)              # (batch, d_wisdom)
         return wisdom
 
     def count_parameters(self):
@@ -725,14 +730,17 @@ class BroadMindV079(nn.Module):
         # Halter (from v0.77, loads pretrained weights)
         self.halter = Halter(config)
 
-    def get_wisdom(self, initial_states, demo_states, demo_next_states, demo_emb=None):
+    def get_wisdom(self, initial_states, demo_states, demo_next_states,
+                   demo_emb=None, aggregate_only=False):
         """Get wisdom from MetaWisdomEncoder."""
-        return self.meta_wisdom(initial_states, demo_states, demo_next_states, demo_emb=demo_emb)
+        return self.meta_wisdom(initial_states, demo_states, demo_next_states,
+                                demo_emb=demo_emb, aggregate_only=aggregate_only)
 
     def forward_all_steps(self, programs, initial_states, demo_states, demo_next_states,
-                          training_noise_std=0.0, demo_emb=None):
+                          training_noise_std=0.0, demo_emb=None, aggregate_only=False):
         """Run all steps with meta-wisdom."""
-        wisdom = self.get_wisdom(initial_states, demo_states, demo_next_states, demo_emb=demo_emb)
+        wisdom = self.get_wisdom(initial_states, demo_states, demo_next_states,
+                                 demo_emb=demo_emb, aggregate_only=aggregate_only)
 
         preds, states, compute_cost = self.solver(
             programs, initial_states, wisdom,
@@ -888,14 +896,54 @@ def load_v077_checkpoint(model, checkpoint_path):
     return old_wisdom_codes
 
 # ============================================================================
+# SUPPORT SET HELPERS
+# ============================================================================
+
+def generate_family_support_sets(n_support=16):
+    """Generate one support set per training family.
+
+    Returns dict: family_id -> (states, next_states) each (n_support, 3)
+    """
+    support = {}
+    for fam_id, fam_info in TRAIN_FAMILIES.items():
+        fam = {fam_id: fam_info}
+        s, ns = generate_support_transitions(fam, n_support)
+        support[fam_id] = (s, ns)
+    return support
+
+
+def build_per_sample_support(family_ids, family_support):
+    """Build per-sample support tensors from per-family support sets.
+
+    Each sample gets the support set of its family.
+    Returns: (batch, K, 3), (batch, K, 3)
+    """
+    batch_size = family_ids.shape[0]
+    K = list(family_support.values())[0][0].shape[0]
+
+    all_s = []
+    all_ns = []
+    for b in range(batch_size):
+        fid = family_ids[b].item()
+        if fid in family_support:
+            s, ns = family_support[fid]
+        else:
+            # Fallback for novel families — use random training family
+            s, ns = list(family_support.values())[0]
+        all_s.append(s)
+        all_ns.append(ns)
+
+    return torch.stack(all_s), torch.stack(all_ns)
+
+# ============================================================================
 # TRAINING PHASES
 # ============================================================================
 
 def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
-    """Phase 1: Train MetaWisdomEncoder only (solver + halter frozen).
+    """Phase 1: MetaWisdomEncoder only, aggregate mode, NO NOVEL masking.
 
-    Key trick: wisdom anchoring loss — MetaWisdomEncoder outputs for known families
-    should be close to old v0.77 wisdom codes.
+    Goal: MetaWisdomEncoder produces wisdom close to v0.77 codes.
+    Per-family shared support sets for consistent wisdom.
     """
     model.meta_wisdom.train()
     model.solver.eval()
@@ -903,11 +951,11 @@ def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
 
     optimizer.zero_grad()
 
-    # Generate batch from training families
+    # NO novel masking in Phase 1
     batch = generate_batch(
         config.batch_size, min_len=1, max_len=4,
         families=TRAIN_FAMILIES, mixed_prob=0.3,
-        novel_mask_rate=config.novel_mask_rate,
+        novel_mask_rate=0.0,
     )
 
     programs = batch['program_indices']
@@ -916,45 +964,35 @@ def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
     lengths = batch['lengths']
     family_ids = batch['family_ids']
 
-    # Generate support demos (shared per-family for anchoring)
-    demo_states, demo_next_states = generate_support_batch(
-        TRAIN_FAMILIES, config.batch_size, config.n_support
+    # Per-family shared support sets (consistent wisdom per family)
+    family_support = generate_family_support_sets(config.n_support)
+    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+
+    # Get wisdom — aggregate_only mode (no problem-state dependency)
+    wisdom = model.get_wisdom(
+        initial_states, demo_states, demo_next_states, aggregate_only=True
     )
 
-    # Get wisdom from MetaWisdomEncoder
-    wisdom = model.get_wisdom(initial_states, demo_states, demo_next_states)
+    # Run solver with gradients through wisdom
+    preds, _, _ = model.solver(programs, initial_states, wisdom)
 
-    # Run solver (frozen) with generated wisdom
-    with torch.no_grad():
-        preds, _, compute_cost = model.solver(programs, initial_states, wisdom.detach())
-
-    # But we need gradients through wisdom for the task loss
-    preds_grad, _, _ = model.solver(programs, initial_states, wisdom)
-
-    batch_size, max_steps, n_vars = preds_grad.shape
-    mask = torch.arange(max_steps, device=preds_grad.device).unsqueeze(0) < lengths.unsqueeze(1)
+    batch_size, max_steps, n_vars = preds.shape
+    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
     mask = mask.unsqueeze(-1).float()
 
-    task_loss = ((preds_grad - intermediate) ** 2 * mask).sum() / mask.sum()
+    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
 
-    # Wisdom anchoring loss (only for training families with known wisdom codes)
+    # Strong wisdom anchoring loss
     anchor_loss = torch.tensor(0.0, device=config.device)
     if old_wisdom_codes is not None:
-        # Decay anchoring over time
         anchor_w = config.anchor_weight * (config.anchor_decay ** iteration)
 
-        # For each family, generate demos and compare wisdom to v0.77 codes
         for fam_id in range(config.n_train_families):
             fam_mask = (family_ids == fam_id)
             if fam_mask.sum() == 0:
                 continue
-
-            # Get the wisdom for samples from this family
-            fam_wisdom = wisdom[fam_mask]  # (n_fam, 48)
-
-            # Target: old v0.77 wisdom code for this family
+            fam_wisdom = wisdom[fam_mask]
             target = old_wisdom_codes[fam_id].unsqueeze(0).expand_as(fam_wisdom)
-
             anchor_loss = anchor_loss + F.mse_loss(fam_wisdom, target)
 
         anchor_loss = anchor_loss / max(config.n_train_families, 1)
@@ -969,8 +1007,62 @@ def train_phase1_meta_wisdom(model, optimizer, old_wisdom_codes, iteration):
     return task_loss.item(), anchor_loss.item()
 
 
-def train_phase2_joint(model, optimizer):
-    """Phase 2: Joint fine-tuning of MetaWisdomEncoder + Solver."""
+def train_phase1b_novel_dependency(model, optimizer, iteration, total_iterations):
+    """Phase 1b: Teach solver to depend on wisdom when seeing NOVEL token.
+
+    Solver trainable, MetaWisdom frozen. Gradually ramp NOVEL masking 0% -> 30%.
+    """
+    model.solver.train()
+    model.meta_wisdom.eval()
+    model.halter.eval()
+
+    optimizer.zero_grad()
+
+    # Ramp NOVEL masking linearly
+    progress = iteration / max(total_iterations - 1, 1)
+    novel_rate = config.novel_mask_rate * progress  # 0 -> 0.3
+
+    batch = generate_batch(
+        config.batch_size, min_len=1, max_len=4,
+        families=TRAIN_FAMILIES, mixed_prob=0.5,
+        novel_mask_rate=novel_rate,
+    )
+
+    programs = batch['program_indices']
+    initial_states = batch['initial_states']
+    intermediate = batch['intermediate']
+    lengths = batch['lengths']
+    family_ids = batch['family_ids']
+
+    # Per-family support
+    family_support = generate_family_support_sets(config.n_support)
+    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+
+    # Frozen MetaWisdom produces wisdom
+    with torch.no_grad():
+        wisdom = model.get_wisdom(
+            initial_states, demo_states, demo_next_states, aggregate_only=True
+        )
+
+    preds, _, compute_cost = model.solver(programs, initial_states, wisdom)
+
+    batch_size, max_steps, n_vars = preds.shape
+    mask = torch.arange(max_steps, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)
+    mask = mask.unsqueeze(-1).float()
+
+    task_loss = ((preds - intermediate) ** 2 * mask).sum() / mask.sum()
+    cost_loss = config.compute_cost_weight * compute_cost
+    loss = task_loss + cost_loss
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.solver.parameters(), config.grad_clip)
+    optimizer.step()
+
+    return task_loss.item(), novel_rate
+
+
+def train_phase2_joint(model, optimizer, iteration, total_iterations):
+    """Phase 2: Joint MetaWisdom (cross-attention) + Solver. NOVEL at 30%."""
     model.meta_wisdom.train()
     model.solver.train()
     model.halter.eval()
@@ -987,12 +1079,16 @@ def train_phase2_joint(model, optimizer):
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
+    family_ids = batch['family_ids']
 
-    demo_states, demo_next_states = generate_support_batch(
-        TRAIN_FAMILIES, config.batch_size, config.n_support
+    # Per-family support
+    family_support = generate_family_support_sets(config.n_support)
+    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
+
+    # Full cross-attention mode (not aggregate)
+    wisdom = model.get_wisdom(
+        initial_states, demo_states, demo_next_states, aggregate_only=False
     )
-
-    wisdom = model.get_wisdom(initial_states, demo_states, demo_next_states)
     preds, _, compute_cost = model.solver(programs, initial_states, wisdom)
 
     batch_size, max_steps, n_vars = preds.shape
@@ -1011,7 +1107,7 @@ def train_phase2_joint(model, optimizer):
 
 
 def train_phase3_halter(model, optimizer):
-    """Phase 3: Train halter only (solver + meta_wisdom frozen)."""
+    """Phase 3: Train halter only."""
     model.halter.train()
     model.solver.eval()
     model.meta_wisdom.eval()
@@ -1043,7 +1139,7 @@ def train_phase3_halter(model, optimizer):
 
 
 def train_phase4_e2e(model, optimizer):
-    """Phase 4: End-to-end fine-tuning (all components)."""
+    """Phase 4: End-to-end fine-tuning. NOVEL masking at 30%."""
     model.train()
     optimizer.zero_grad()
 
@@ -1057,10 +1153,10 @@ def train_phase4_e2e(model, optimizer):
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
+    family_ids = batch['family_ids']
 
-    demo_states, demo_next_states = generate_support_batch(
-        TRAIN_FAMILIES, config.batch_size, config.n_support
-    )
+    family_support = generate_family_support_sets(config.n_support)
+    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
 
     preds, halt_logits, wisdom, compute_cost = model.forward_all_steps(
         programs, initial_states, demo_states, demo_next_states,
@@ -1089,7 +1185,7 @@ def train_phase4_e2e(model, optimizer):
 
 
 def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
-    """Phase 5: Length generalization with noise + meta-wisdom."""
+    """Phase 5: Length generalization with noise. NOVEL masking at 30%."""
     model.solver.train()
     model.meta_wisdom.train()
     model.halter.eval()
@@ -1109,14 +1205,13 @@ def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
     initial_states = batch['initial_states']
     intermediate = batch['intermediate']
     lengths = batch['lengths']
+    family_ids = batch['family_ids']
 
-    demo_states, demo_next_states = generate_support_batch(
-        TRAIN_FAMILIES, config.batch_size, config.n_support
-    )
+    family_support = generate_family_support_sets(config.n_support)
+    demo_states, demo_next_states = build_per_sample_support(family_ids, family_support)
 
     wisdom = model.get_wisdom(initial_states, demo_states, demo_next_states)
 
-    # Noisy run
     preds_noisy, _, compute_cost = model.solver(
         programs, initial_states, wisdom,
         training_noise_std=noise_std,
@@ -1128,7 +1223,6 @@ def train_phase5_lengthgen(model, optimizer, iteration, total_iterations):
 
     task_loss = ((preds_noisy - intermediate) ** 2 * mask).sum() / mask.sum()
 
-    # Consistency loss
     with torch.no_grad():
         preds_clean, _, _ = model.solver(
             programs, initial_states, wisdom.detach(),
@@ -1442,10 +1536,10 @@ def main():
 
     start_time = time.time()
 
-    # ---- Phase 1: MetaWisdomEncoder only ----
+    # ---- Phase 1: MetaWisdomEncoder only (aggregate, no NOVEL) ----
     print("=" * 70)
-    print(f"Phase 1: MetaWisdomEncoder training ({config.n_iterations_phase1} iterations)")
-    print("  Solver frozen, wisdom anchoring active")
+    print(f"Phase 1: MetaWisdomEncoder training ({config.n_iterations_phase1} iters)")
+    print("  Aggregate mode, NO NOVEL masking, strong anchoring")
     print("=" * 70)
 
     optimizer = torch.optim.AdamW(
@@ -1459,21 +1553,47 @@ def main():
             model, optimizer, old_wisdom_codes, i
         )
 
-        if (i + 1) % 200 == 0:
+        if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
             anchor_w = config.anchor_weight * (config.anchor_decay ** i)
             print(f"  P1 [{i+1:4d}/{config.n_iterations_phase1}] "
                   f"task={task_loss:.4f} anchor={anchor_loss:.4f} "
-                  f"(w={anchor_w:.3f}) solver_acc={acc:.1f}%")
+                  f"(w={anchor_w:.3f}) acc={acc:.1f}%")
 
     p1_acc = evaluate_solver_only(model, n_batches=10)
-    print(f"\n  Phase 1 result: solver_acc = {p1_acc:.1f}%")
+    print(f"\n  Phase 1 done: acc = {p1_acc:.1f}%")
 
-    # ---- Phase 2: Joint MetaWisdom + Solver ----
+    # ---- Phase 1b: Teach solver NOVEL dependency ----
     print()
     print("=" * 70)
-    print(f"Phase 2: Joint fine-tuning ({config.n_iterations_phase2} iterations)")
-    print("  MetaWisdomEncoder + Solver, LR=5e-4")
+    print(f"Phase 1b: NOVEL dependency ({config.n_iterations_phase1b} iters)")
+    print("  Solver trains, MetaWisdom frozen, NOVEL ramps 0% -> 30%")
+    print("=" * 70)
+
+    optimizer = torch.optim.AdamW(
+        model.solver.parameters(),
+        lr=config.lr_joint,
+        weight_decay=config.weight_decay,
+    )
+
+    for i in range(config.n_iterations_phase1b):
+        task_loss, novel_rate = train_phase1b_novel_dependency(
+            model, optimizer, i, config.n_iterations_phase1b
+        )
+
+        if (i + 1) % 300 == 0:
+            acc = evaluate_solver_only(model, n_batches=5)
+            print(f"  P1b [{i+1:4d}/{config.n_iterations_phase1b}] "
+                  f"task={task_loss:.4f} novel_rate={novel_rate:.2f} acc={acc:.1f}%")
+
+    p1b_acc = evaluate_solver_only(model, n_batches=10)
+    print(f"\n  Phase 1b done: acc = {p1b_acc:.1f}%")
+
+    # ---- Phase 2: Joint with cross-attention ----
+    print()
+    print("=" * 70)
+    print(f"Phase 2: Joint fine-tuning ({config.n_iterations_phase2} iters)")
+    print("  Cross-attention mode, NOVEL at 30%, LR=5e-4")
     print("=" * 70)
 
     optimizer = torch.optim.AdamW(
@@ -1483,20 +1603,20 @@ def main():
     )
 
     for i in range(config.n_iterations_phase2):
-        task_loss, cost_loss = train_phase2_joint(model, optimizer)
+        task_loss, cost_loss = train_phase2_joint(model, optimizer, i, config.n_iterations_phase2)
 
-        if (i + 1) % 200 == 0:
+        if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
             print(f"  P2 [{i+1:4d}/{config.n_iterations_phase2}] "
                   f"task={task_loss:.4f} cost={cost_loss:.4f} acc={acc:.1f}%")
 
     p2_acc = evaluate_solver_only(model, n_batches=10)
-    print(f"\n  Phase 2 result: solver_acc = {p2_acc:.1f}%")
+    print(f"\n  Phase 2 done: acc = {p2_acc:.1f}%")
 
     # ---- Phase 3: Halter only ----
     print()
     print("=" * 70)
-    print(f"Phase 3: Halter training ({config.n_iterations_phase3} iterations)")
+    print(f"Phase 3: Halter training ({config.n_iterations_phase3} iters)")
     print("=" * 70)
 
     optimizer = torch.optim.AdamW(
@@ -1514,8 +1634,8 @@ def main():
     # ---- Phase 4: End-to-end ----
     print()
     print("=" * 70)
-    print(f"Phase 4: End-to-end fine-tuning ({config.n_iterations_phase4} iterations)")
-    print("  LR=1e-4, all components")
+    print(f"Phase 4: End-to-end ({config.n_iterations_phase4} iters)")
+    print("  LR=1e-4, all components, NOVEL at 30%")
     print("=" * 70)
 
     optimizer = torch.optim.AdamW(
@@ -1527,7 +1647,7 @@ def main():
     for i in range(config.n_iterations_phase4):
         task_loss, halt_loss = train_phase4_e2e(model, optimizer)
 
-        if (i + 1) % 200 == 0:
+        if (i + 1) % 300 == 0:
             acc = evaluate_solver_only(model, n_batches=5)
             print(f"  P4 [{i+1:4d}/{config.n_iterations_phase4}] "
                   f"task={task_loss:.4f} halt={halt_loss:.4f} acc={acc:.1f}%")
@@ -1535,7 +1655,7 @@ def main():
     # ---- Phase 5: Length generalization ----
     print()
     print("=" * 70)
-    print(f"Phase 5: Length generalization ({config.n_iterations_phase5} iterations)")
+    print(f"Phase 5: Length generalization ({config.n_iterations_phase5} iters)")
     print("  Solver + MetaWisdom, noise injection")
     print("=" * 70)
 
@@ -1550,7 +1670,7 @@ def main():
             model, optimizer, i, config.n_iterations_phase5
         )
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 200 == 0:
             print(f"  P5 [{i+1:4d}/{config.n_iterations_phase5}] "
                   f"task={task_loss:.4f} cons={cons_loss:.4f} noise={noise:.3f}")
 
